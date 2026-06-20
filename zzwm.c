@@ -614,7 +614,13 @@ int main(void) {
     z.overlay = XCompositeGetOverlayWindow(z.dpy, z.root);
     XSelectInput(z.dpy, z.overlay, ButtonPressMask|ButtonReleaseMask|PointerMotionMask|KeyPressMask);
     Cursor cur = XCreateFontCursor(z.dpy, XC_left_ptr);
-    XDefineCursor(z.dpy, z.overlay, cur); XFreeCursor(z.dpy, cur);
+    /* Set on the root, not the overlay: the overlay's input shape is empty
+     * (below), so cursor lookup falls through to whatever real window the
+     * pointer is over -- the root when no client is parked there, or a
+     * client with no cursor of its own, which inherits from its parent
+     * (root, since zzwm is non-reparenting). One root-level default covers
+     * both cases. */
+    XDefineCursor(z.dpy, z.root, cur); XFreeCursor(z.dpy, cur);
     /* Empty input shape makes the overlay fully click-through, like
      * InfiniteGlass's overlay_set_input(False): plain clicks pass straight
      * to whichever client on_hover() has parked under the cursor. WM
