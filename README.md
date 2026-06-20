@@ -53,6 +53,10 @@ RGB:
   by default.
 - `BG_*`/`FG_*`/`DIM_*` — background, foreground, and dim text for
   `zzwm-run`, `zzwm-bar`, and `zzwm-help`. Background is white by default.
+- `BORDER_R`/`BORDER_G`/`BORDER_B` — color of the border drawn around every
+  managed window.
+- `BORDER_THICKNESS` — border thickness in canvas pixels at zoom 1.0 (it
+  scales with the window as you zoom). Set to `0` to disable borders.
 
 No changes to any `.c` files are needed.
 

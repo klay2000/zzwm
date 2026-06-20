@@ -202,11 +202,23 @@ static void redraw(ZWM *z) {
     XRectangle rect = { 0, 0, (unsigned short)z->sw, (unsigned short)z->sh };
     XRenderFillRectangles(z->dpy, PictOpSrc, z->overlay_pic, &bg, &rect, 1);
 
+    XRenderColor border_col = { BORDER_R * 257, BORDER_G * 257, BORDER_B * 257, 0xffff };
+
     for (int i = 0; i < z->nclients; i++) {
         Client *c = &z->clients[i];
         int sx, sy, sw, sh;
         srect(c, &z->vp, &sx, &sy, &sw, &sh);
-        if (sx >= z->sw || sy >= z->sh || sx+sw <= 0 || sy+sh <= 0) continue;
+
+        /* Border scales with zoom like the window itself, so it stays
+         * proportional whether you're zoomed in or out. */
+        int bw = (int)(BORDER_THICKNESS * z->vp.zoom + 0.5);
+        int bx = sx - bw, by = sy - bw, bsw = sw + 2*bw, bsh = sh + 2*bw;
+        if (bx >= z->sw || by >= z->sh || bx+bsw <= 0 || by+bsh <= 0) continue;
+        if (bw > 0) {
+            XRectangle brect = { (short)bx, (short)by,
+                                  (unsigned short)bsw, (unsigned short)bsh };
+            XRenderFillRectangles(z->dpy, PictOpSrc, z->overlay_pic, &border_col, &brect, 1);
+        }
 
         Pixmap pix = XCompositeNameWindowPixmap(z->dpy, c->window);
         if (!pix) continue;
