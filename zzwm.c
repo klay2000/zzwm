@@ -5,7 +5,8 @@
  * -------------
  *   scroll wheel        zoom in / out (centred on cursor)
  *   middle-click drag   pan the canvas
- *   left-click window   focus
+ *   left/right-click    focus + raise, then forwarded to the window (click
+ *                        buttons, links, etc. -- see Architecture)
  *   Super+left-drag     move window on canvas
  *   Super+right-drag    resize window
  *
@@ -82,6 +83,9 @@ typedef struct {
     Window move_win;
     int    resizing, resize_sx, resize_sy, resize_cw0, resize_ch0;
     Window resize_win;
+    int          passthrough;
+    unsigned int passthrough_button;
+    Window       passthrough_win;
 } ZWM;
 
 static int g_other_wm;
@@ -126,6 +130,65 @@ static Client *hit(ZWM *z, int sx, int sy) {
         if (sx >= x && sx < x+w && sy >= y && sy < y+h) return &z->clients[i];
     }
     return NULL;
+}
+
+/* Override-redirect windows (menus, tooltips) are drawn at their real
+ * screen position (see redraw()), so hit-testing them is a plain
+ * unscaled rectangle test against their current geometry. */
+static Window hit_override(ZWM *z, int sx, int sy, XWindowAttributes *out) {
+    for (int i = z->noverride - 1; i >= 0; i--) {
+        Window w = z->overrides[i];
+        XWindowAttributes a;
+        if (!XGetWindowAttributes(z->dpy, w, &a) || a.map_state != IsViewable) continue;
+        if (sx >= a.x && sx < a.x + a.width && sy >= a.y && sy < a.y + a.height) {
+            *out = a;
+            return w;
+        }
+    }
+    return None;
+}
+
+/* zzwm draws every client window scaled/panned by the canvas transform, but
+ * the real window itself sits parked off-screen at its native size (see
+ * park()) -- so a screen-space click can't be delivered to it by ordinary
+ * X event routing the way it would on a normal (non-compositing) WM. To
+ * make clicks land on the right pixel of the actual window, invert the
+ * canvas transform to get a canvas point, then subtract the window's
+ * canvas-space origin to get a window-local pixel. */
+static void to_client_local(Client *c, Viewport *v, int sx, int sy, int *wx, int *wy) {
+    double cx, cy;
+    to_canvas(v, sx, sy, &cx, &cy);
+    *wx = (int)(cx - c->cx);
+    *wy = (int)(cy - c->cy);
+}
+
+/* Synthesize an input event aimed at a specific window/coordinate, since
+ * the real pointer position on screen rarely matches where the target
+ * window thinks it is (see to_client_local() above). type is ButtonPress,
+ * ButtonRelease, or MotionNotify; button is ignored for MotionNotify. */
+static void send_input(ZWM *z, int type, Window target, int wx, int wy,
+                        int x_root, int y_root, unsigned int button,
+                        unsigned int state, Time time) {
+    XEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    if (type == MotionNotify) {
+        ev.xmotion.type = MotionNotify;
+        ev.xmotion.window = target;     ev.xmotion.root = z->root;
+        ev.xmotion.x = wx;              ev.xmotion.y = wy;
+        ev.xmotion.x_root = x_root;     ev.xmotion.y_root = y_root;
+        ev.xmotion.state = state;       ev.xmotion.time = time;
+        ev.xmotion.same_screen = True;
+        XSendEvent(z->dpy, target, False, PointerMotionMask, &ev);
+    } else {
+        ev.xbutton.type = type;
+        ev.xbutton.window = target;     ev.xbutton.root = z->root;
+        ev.xbutton.x = wx;              ev.xbutton.y = wy;
+        ev.xbutton.x_root = x_root;     ev.xbutton.y_root = y_root;
+        ev.xbutton.state = state;       ev.xbutton.button = button; ev.xbutton.time = time;
+        ev.xbutton.same_screen = True;
+        XSendEvent(z->dpy, target, False,
+                   type == ButtonPress ? ButtonPressMask : ButtonReleaseMask, &ev);
+    }
 }
 
 /* Clients are drawn (and hit-tested) in array order, last = topmost. Moving
@@ -176,6 +239,9 @@ static void manage_override(ZWM *z, Window w) {
 }
 
 static void unmanage_override(ZWM *z, Window w) {
+    if (z->passthrough_win == w) {
+        z->passthrough = 0; z->passthrough_win = 0; XUngrabPointer(z->dpy, CurrentTime);
+    }
     for (int i = 0; i < z->noverride; i++)
         if (z->overrides[i] == w) { z->overrides[i] = z->overrides[--z->noverride]; return; }
 }
@@ -187,6 +253,9 @@ static void unmanage(ZWM *z, Window w) {
     z->clients[i] = z->clients[--z->nclients];
     if (z->move_win == w)   { z->moving = 0;   z->move_win = 0; }
     if (z->resize_win == w) { z->resizing = 0; z->resize_win = 0; }
+    if (z->passthrough_win == w) {
+        z->passthrough = 0; z->passthrough_win = 0; XUngrabPointer(z->dpy, CurrentTime);
+    }
     if (z->focused == w) {
         z->focused = z->nclients ? z->clients[z->nclients-1].window : 0;
         if (z->focused) XSetInputFocus(z->dpy, z->focused, RevertToPointerRoot, CurrentTime);
@@ -319,7 +388,7 @@ static void on_button(ZWM *z, XButtonEvent *ev) {
                      GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
         return;
     }
-    if (ev->button == 1) {
+    if (ev->button == 1 || ev->button == 3) {
         Client *c = hit(z, ev->x_root, ev->y_root);
         if (c) {
             raise_client(z, c);
@@ -327,27 +396,46 @@ static void on_button(ZWM *z, XButtonEvent *ev) {
             z->focused = c->window; XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
             redraw(z);
         }
-        if ((ev->state & Mod4Mask) && c && !c->anchor) {
+        if (ev->button == 1 && (ev->state & Mod4Mask) && c && !c->anchor) {
             z->moving = 1; z->move_win = c->window;
             z->move_sx = ev->x_root; z->move_sy = ev->y_root;
             z->move_cx = c->cx;      z->move_cy = c->cy;
             XGrabPointer(z->dpy, z->overlay, True, PointerMotionMask|ButtonReleaseMask,
                          GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+            return;
         }
-    }
-    if (ev->button == 3) {
-        Client *c = hit(z, ev->x_root, ev->y_root);
-        if ((ev->state & Mod4Mask) && c) {
-            raise_client(z, c);
-            c = &z->clients[z->nclients - 1];
-            z->focused = c->window; XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
-            redraw(z);
+        if (ev->button == 3 && (ev->state & Mod4Mask) && c) {
             z->resizing = 1; z->resize_win = c->window;
             z->resize_sx = ev->x_root; z->resize_sy = ev->y_root;
             z->resize_cw0 = c->cw;     z->resize_ch0 = c->ch;
             XGrabPointer(z->dpy, z->overlay, True, PointerMotionMask|ButtonReleaseMask,
                          GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+            return;
         }
+
+        /* Not a WM gesture (move/resize) -- forward the click straight
+         * through to whatever's visually under the pointer: a client,
+         * translated through the canvas transform, or an override-redirect
+         * popup at its real screen position. */
+        Window target; int wx, wy;
+        if (c) {
+            to_client_local(c, &z->vp, ev->x_root, ev->y_root, &wx, &wy);
+            target = c->window;
+        } else {
+            XWindowAttributes a;
+            target = hit_override(z, ev->x_root, ev->y_root, &a);
+            if (!target) return;
+            wx = ev->x_root - a.x; wy = ev->y_root - a.y;
+        }
+        z->passthrough = 1; z->passthrough_win = target; z->passthrough_button = ev->button;
+        /* Explicit grab, same as the move/resize/pan gestures above --
+         * the passive XGrabButton at the bottom of main() only asks for
+         * ButtonPressMask, so without this, ButtonRelease/MotionNotify for
+         * this click aren't guaranteed to reach us at all. */
+        XGrabPointer(z->dpy, z->overlay, True, PointerMotionMask|ButtonReleaseMask,
+                     GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+        send_input(z, ButtonPress, target, wx, wy, ev->x_root, ev->y_root,
+                   ev->button, ev->state, ev->time);
     }
 }
 
@@ -356,6 +444,23 @@ static void on_release(ZWM *z, XButtonEvent *ev) {
         (ev->button == 3 && z->resizing)) {
         z->panning = z->moving = z->resizing = 0;
         z->move_win = z->resize_win = 0;
+        XUngrabPointer(z->dpy, CurrentTime);
+    } else if (z->passthrough && ev->button == z->passthrough_button) {
+        Window target = z->passthrough_win;
+        int wx, wy;
+        Client *c = find(z, target);
+        if (c) {
+            to_client_local(c, &z->vp, ev->x_root, ev->y_root, &wx, &wy);
+        } else {
+            XWindowAttributes a;
+            if (!XGetWindowAttributes(z->dpy, target, &a)) {
+                z->passthrough = 0; XUngrabPointer(z->dpy, CurrentTime); return;
+            }
+            wx = ev->x_root - a.x; wy = ev->y_root - a.y;
+        }
+        send_input(z, ButtonRelease, target, wx, wy, ev->x_root, ev->y_root,
+                   ev->button, ev->state, ev->time);
+        z->passthrough = 0; z->passthrough_win = 0;
         XUngrabPointer(z->dpy, CurrentTime);
     }
 }
@@ -384,6 +489,21 @@ static void on_motion(ZWM *z, XMotionEvent *ev) {
         z->vp.cx = z->pan_vx - (ev->x_root - z->pan_sx) / z->vp.zoom;
         z->vp.cy = z->pan_vy - (ev->y_root - z->pan_sy) / z->vp.zoom;
         redraw(z);
+    } else if (z->passthrough) {
+        Window target = z->passthrough_win;
+        Client *c = find(z, target);
+        int wx, wy;
+        if (c) {
+            to_client_local(c, &z->vp, ev->x_root, ev->y_root, &wx, &wy);
+        } else {
+            XWindowAttributes a;
+            if (!XGetWindowAttributes(z->dpy, target, &a)) {
+                z->passthrough = 0; XUngrabPointer(z->dpy, CurrentTime); return;
+            }
+            wx = ev->x_root - a.x; wy = ev->y_root - a.y;
+        }
+        send_input(z, MotionNotify, target, wx, wy, ev->x_root, ev->y_root,
+                   0, ev->state, ev->time);
     }
 }
 
