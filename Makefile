@@ -5,7 +5,7 @@ U       = utility-apps
 all: zzwm zzwm-run zzwm-bar zzwm-help
 
 zzwm: zzwm.c config.h appearance.h
-	$(CC) $(CFLAGS) -o $@ $< -lX11 -lXrender -lXcomposite -lXdamage
+	$(CC) $(CFLAGS) -o $@ $< -lX11 -lXrender -lXcomposite -lXdamage -lXrandr
 
 zzwm-run: $(U)/runner.c appearance.h
 	$(CC) $(CFLAGS) -o $@ $< -lX11

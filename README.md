@@ -62,11 +62,12 @@ No changes to any `.c` files are needed.
 make
 ```
 
-Requires: `libX11`, `libXrender`, `libXcomposite`, `libXdamage` (standard on any X desktop).
+Requires: `libX11`, `libXrender`, `libXcomposite`, `libXdamage`, `libXrandr`
+(standard on any X desktop).
 
 ```sh
 # Debian/Ubuntu:
-apt install libx11-dev libxrender-dev libxcomposite-dev libxdamage-dev xserver-xephyr
+apt install libx11-dev libxrender-dev libxcomposite-dev libxdamage-dev libxrandr-dev xserver-xephyr
 ```
 
 Always test inside a nested X server:
@@ -101,6 +102,22 @@ magnifying (crisp, avoids blur).
 (including override-redirect popups like menus) and redraws the overlay
 whenever window content changes.
 
+**Multi-monitor** — all clients live on one shared canvas (`Client.cx/cy`
+are canvas coordinates, independent of any monitor). Each physical monitor
+(as reported by XRandR) gets its own `Viewport` — its own pan position and
+zoom level — onto that same canvas, so you can be zoomed into one part of
+the canvas on one monitor while a second monitor shows a totally different
+position/zoom of the same windows. The composite overlay window still spans
+the whole root, so each monitor's pass clips rendering to its own screen
+rect before compositing clients through its `Viewport`. Scroll/middle-drag/
+move/resize all act on whichever monitor the pointer is over at the time;
+a window dragged with Super+drag moves in canvas space, so it instantly
+reflects on every monitor's view that can see that part of the canvas.
+Monitor layout is re-read on `RRScreenChangeNotify` (monitor
+plugged/unplugged or moved); a monitor that keeps its RandR output name
+across a reconfiguration keeps its pan/zoom, a newly appeared one starts
+centered at the canvas origin.
+
 **zzwm-run, zzwm-bar, and zzwm-help are separate processes**, not built into
 `zzwm`. All are plain client windows with no special X properties; zzwm
 treats `zzwm-run` and `zzwm-help` like any other window (centred on the
@@ -131,6 +148,5 @@ scroll / pan → Viewport(cx, cy, zoom) → redraw()
   reach client windows at all — zzwm grabs every pointer button on its
   overlay window (`AnyModifier`), so only keyboard input (which follows
   focus) gets through to the focused client.
-- Single monitor only.
 - Windows with non-standard visuals (depth ≠ 24/32) are skipped.
 - Max 64 managed windows (`MAX_CLIENTS`).

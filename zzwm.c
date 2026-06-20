@@ -15,7 +15,7 @@
  *
  * zzwm-run, zzwm-bar, zzwm-help are separate binaries (utility-apps/).
  *
- * Build:  cc -O2 -o zzwm zzwm.c -lX11 -lXrender -lXcomposite
+ * Build:  cc -O2 -o zzwm zzwm.c -lX11 -lXrender -lXcomposite -lXrandr
  * Test:   Xephyr :1 -screen 1280x800 && DISPLAY=:1 ./zzwm
  */
 
@@ -29,13 +29,15 @@
 #include <X11/extensions/Xcomposite.h>
 #include <X11/extensions/Xdamage.h>
 #include <X11/extensions/Xrender.h>
+#include <X11/extensions/Xrandr.h>
 
 #include "appearance.h"
 
-#define ZOOM_SPEED   1.1
-#define ZOOM_MIN     0.05
-#define ZOOM_MAX     20.0
-#define MAX_CLIENTS  64
+#define ZOOM_SPEED    1.1
+#define ZOOM_MIN      0.05
+#define ZOOM_MAX      20.0
+#define MAX_CLIENTS   64
+#define MAX_MONITORS  16
 
 typedef enum { ACT_SPAWN, ACT_CLOSE } Action;
 
@@ -66,12 +68,26 @@ typedef struct {
     double cx, cy, zoom;
 } Viewport;
 
+/* Each physical monitor gets its own independent Viewport (pan + zoom) onto
+ * the single shared canvas that holds all Clients. mx/my/mw/mh are the
+ * monitor's position and size within the root window (as reported by
+ * XRandR); Viewport.sw/sh mirror mw/mh so to_screen()/to_canvas() treat the
+ * monitor's own center as the origin for pan/zoom math. */
+typedef struct {
+    int      mx, my, mw, mh;
+    Viewport vp;
+    char     name[64];   /* RandR output name, used to keep a monitor's
+                             viewport stable across reconfiguration */
+} Monitor;
+
 typedef struct {
     Display  *dpy;
     Window    root, overlay;
     Picture   overlay_pic;
-    int       sw, sh;
-    Viewport  vp;
+    int       sw, sh;        /* full root bounding size, all monitors */
+    Monitor   monitors[MAX_MONITORS];
+    int       nmonitors;
+    int       randr_event;
     XRenderPictFormat *fmt32, *fmt24;
     Client    clients[MAX_CLIENTS];
     int       nclients;
@@ -79,12 +95,12 @@ typedef struct {
     int       noverride;
     Window    focused;
     int       damage_event;
-    int    panning, pan_sx, pan_sy;
+    int    panning, pan_sx, pan_sy, pan_mon;
     double pan_vx, pan_vy;
-    int    moving, move_sx, move_sy;
+    int    moving, move_sx, move_sy, move_mon;
     double move_cx, move_cy;
     Window move_win;
-    int    resizing, resize_sx, resize_sy, resize_cw0, resize_ch0;
+    int    resizing, resize_sx, resize_sy, resize_cw0, resize_ch0, resize_mon;
     Window resize_win;
 } ZWM;
 
@@ -117,16 +133,30 @@ static void srect(Client *c, Viewport *v, int *x, int *y, int *w, int *h) {
     *h = (int)(c->ch * v->zoom); if (*h < 1) *h = 1;
 }
 
+/* Resolve a root-relative point to the Monitor it falls within. Always
+ * returns non-NULL once monitors have been detected (falls back to the
+ * first monitor for points outside every monitor's bounds, e.g. while a
+ * drag's pointer briefly crosses a gap between monitors). */
+static Monitor *find_monitor(ZWM *z, int x_root, int y_root) {
+    for (int i = 0; i < z->nmonitors; i++) {
+        Monitor *m = &z->monitors[i];
+        if (x_root >= m->mx && x_root < m->mx + m->mw &&
+            y_root >= m->my && y_root < m->my + m->mh) return m;
+    }
+    return &z->monitors[0];
+}
+
 static Client *find(ZWM *z, Window w) {
     for (int i = 0; i < z->nclients; i++)
         if (z->clients[i].window == w) return &z->clients[i];
     return NULL;
 }
 
-static Client *hit(ZWM *z, int sx, int sy) {
+/* sx/sy are monitor-local (relative to m->mx/m->my). */
+static Client *hit(ZWM *z, Monitor *m, int sx, int sy) {
     for (int i = z->nclients - 1; i >= 0; i--) {
         int x, y, w, h;
-        srect(&z->clients[i], &z->vp, &x, &y, &w, &h);
+        srect(&z->clients[i], &m->vp, &x, &y, &w, &h);
         if (sx >= x && sx < x+w && sy >= y && sy < y+h) return &z->clients[i];
     }
     return NULL;
@@ -152,7 +182,8 @@ static Client *manage(ZWM *z, Window w) {
     if (!XGetWindowAttributes(z->dpy, w, &a)) return NULL;
     Client *c = &z->clients[z->nclients++];
     c->window = w;
-    to_canvas(&z->vp, a.x, a.y, &c->cx, &c->cy);
+    Monitor *m = find_monitor(z, a.x, a.y);
+    to_canvas(&m->vp, a.x - m->mx, a.y - m->my, &c->cx, &c->cy);
     c->cw = a.width; c->ch = a.height; c->depth = a.depth;
     char *name = NULL;
     c->anchor = XFetchName(z->dpy, w, &name) && name && !strcmp(name, ANCHOR_NAME);
@@ -199,35 +230,51 @@ static void unmanage(ZWM *z, Window w) {
 
 static void redraw(ZWM *z) {
     XRenderColor bg = { CANVAS_BG_R * 257, CANVAS_BG_G * 257, CANVAS_BG_B * 257, 0xffff };
-    XRectangle rect = { 0, 0, (unsigned short)z->sw, (unsigned short)z->sh };
-    XRenderFillRectangles(z->dpy, PictOpSrc, z->overlay_pic, &bg, &rect, 1);
+    XRectangle full = { 0, 0, (unsigned short)z->sw, (unsigned short)z->sh };
+    XRenderFillRectangles(z->dpy, PictOpSrc, z->overlay_pic, &bg, &full, 1);
 
-    for (int i = 0; i < z->nclients; i++) {
-        Client *c = &z->clients[i];
-        int sx, sy, sw, sh;
-        srect(c, &z->vp, &sx, &sy, &sw, &sh);
-        if (sx >= z->sw || sy >= z->sh || sx+sw <= 0 || sy+sh <= 0) continue;
+    /* Each monitor renders the same canvas through its own Viewport. Clip to
+     * the monitor's rect on the shared overlay so a window that's clipped
+     * out of one monitor's view doesn't bleed into a neighboring monitor
+     * that happens to be panned/zoomed to show it at the same overlay
+     * coordinates. */
+    for (int mi = 0; mi < z->nmonitors; mi++) {
+        Monitor *m = &z->monitors[mi];
+        XRectangle clip = { (short)m->mx, (short)m->my,
+                             (unsigned short)m->mw, (unsigned short)m->mh };
+        XRenderSetPictureClipRectangles(z->dpy, z->overlay_pic, 0, 0, &clip, 1);
 
-        Pixmap pix = XCompositeNameWindowPixmap(z->dpy, c->window);
-        if (!pix) continue;
-        Picture src = XRenderCreatePicture(z->dpy, pix,
-            c->depth == 32 ? z->fmt32 : z->fmt24, 0, NULL);
+        for (int i = 0; i < z->nclients; i++) {
+            Client *c = &z->clients[i];
+            int sx, sy, sw, sh;
+            srect(c, &m->vp, &sx, &sy, &sw, &sh);
+            if (sx >= m->mw || sy >= m->mh || sx+sw <= 0 || sy+sh <= 0) continue;
+            sx += m->mx; sy += m->my;
 
-        if (z->vp.zoom != 1.0) {
-            XFixed inv = XDoubleToFixed(1.0 / z->vp.zoom);
-            XTransform xf = {{{ inv, 0, 0 }, { 0, inv, 0 }, { 0, 0, XDoubleToFixed(1.0) }}};
-            /* Bilinear smooths nicely when shrinking, but blurs when
-             * magnifying -- nearest-neighbor keeps zoomed-in content crisp. */
-            const char *filt = z->vp.zoom > 1.0 ? FilterNearest : FilterBilinear;
-            XRenderSetPictureFilter(z->dpy, src, filt, NULL, 0);
-            XRenderSetPictureTransform(z->dpy, src, &xf);
+            Pixmap pix = XCompositeNameWindowPixmap(z->dpy, c->window);
+            if (!pix) continue;
+            Picture src = XRenderCreatePicture(z->dpy, pix,
+                c->depth == 32 ? z->fmt32 : z->fmt24, 0, NULL);
+
+            if (m->vp.zoom != 1.0) {
+                XFixed inv = XDoubleToFixed(1.0 / m->vp.zoom);
+                XTransform xf = {{{ inv, 0, 0 }, { 0, inv, 0 }, { 0, 0, XDoubleToFixed(1.0) }}};
+                /* Bilinear smooths nicely when shrinking, but blurs when
+                 * magnifying -- nearest-neighbor keeps zoomed-in content crisp. */
+                const char *filt = m->vp.zoom > 1.0 ? FilterNearest : FilterBilinear;
+                XRenderSetPictureFilter(z->dpy, src, filt, NULL, 0);
+                XRenderSetPictureTransform(z->dpy, src, &xf);
+            }
+            XRenderComposite(z->dpy, PictOpSrc, src, None, z->overlay_pic,
+                             0, 0, 0, 0, sx, sy, sw, sh);
+            XRenderFreePicture(z->dpy, src);
+            XFreePixmap(z->dpy, pix);
         }
-        XRenderComposite(z->dpy, PictOpSrc, src, None, z->overlay_pic,
-                         0, 0, 0, 0, sx, sy, sw, sh);
-        XRenderFreePicture(z->dpy, src);
-        XFreePixmap(z->dpy, pix);
     }
+    XRenderSetPictureClipRectangles(z->dpy, z->overlay_pic, 0, 0, &full, 1);
 
+    /* Override-redirect popups sit at a fixed real screen position (never
+     * canvas-scaled), so they're drawn once, independent of any monitor. */
     for (int i = 0; i < z->noverride; i++) {
         Window w = z->overrides[i];
         XWindowAttributes a;
@@ -259,8 +306,14 @@ static void on_map(ZWM *z, XMapRequestEvent *ev) {
             c->cx = -c->cw / 2.0;
             c->cy = -c->ch / 2.0;
         } else {
-            c->cx = z->vp.cx - c->cw / 2.0;
-            c->cy = z->vp.cy - c->ch / 2.0;
+            /* New windows appear centered on whichever monitor's viewport
+             * the pointer is currently over, so they land where the user
+             * is looking rather than always on a fixed monitor. */
+            Window dr, dc; int rx, ry, wx, wy; unsigned int mask;
+            XQueryPointer(z->dpy, z->root, &dr, &dc, &rx, &ry, &wx, &wy, &mask);
+            Monitor *m = find_monitor(z, rx, ry);
+            c->cx = m->vp.cx - c->cw / 2.0;
+            c->cy = m->vp.cy - c->ch / 2.0;
         }
     }
     XMapWindow(z->dpy, ev->window);
@@ -302,17 +355,21 @@ static void on_configure(ZWM *z, XConfigureRequestEvent *ev) {
 }
 
 static void on_button(ZWM *z, XButtonEvent *ev) {
-    if (ev->button == 4) { zoom_at(&z->vp, ev->x_root, ev->y_root, ZOOM_SPEED);     redraw(z); return; }
-    if (ev->button == 5) { zoom_at(&z->vp, ev->x_root, ev->y_root, 1.0/ZOOM_SPEED); redraw(z); return; }
+    Monitor *m = find_monitor(z, ev->x_root, ev->y_root);
+    int lx = ev->x_root - m->mx, ly = ev->y_root - m->my;
+
+    if (ev->button == 4) { zoom_at(&m->vp, lx, ly, ZOOM_SPEED);     redraw(z); return; }
+    if (ev->button == 5) { zoom_at(&m->vp, lx, ly, 1.0/ZOOM_SPEED); redraw(z); return; }
     if (ev->button == 2) {
         z->panning = 1; z->pan_sx = ev->x_root; z->pan_sy = ev->y_root;
-        z->pan_vx = z->vp.cx; z->pan_vy = z->vp.cy;
+        z->pan_mon = (int)(m - z->monitors);
+        z->pan_vx = m->vp.cx; z->pan_vy = m->vp.cy;
         XGrabPointer(z->dpy, z->overlay, True, PointerMotionMask|ButtonReleaseMask,
                      GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
         return;
     }
     if (ev->button == 1) {
-        Client *c = hit(z, ev->x_root, ev->y_root);
+        Client *c = hit(z, m, lx, ly);
         if (c) {
             raise_client(z, c);
             c = &z->clients[z->nclients - 1];
@@ -321,6 +378,7 @@ static void on_button(ZWM *z, XButtonEvent *ev) {
         }
         if ((ev->state & Mod4Mask) && c && !c->anchor) {
             z->moving = 1; z->move_win = c->window;
+            z->move_mon = (int)(m - z->monitors);
             z->move_sx = ev->x_root; z->move_sy = ev->y_root;
             z->move_cx = c->cx;      z->move_cy = c->cy;
             XGrabPointer(z->dpy, z->overlay, True, PointerMotionMask|ButtonReleaseMask,
@@ -328,13 +386,14 @@ static void on_button(ZWM *z, XButtonEvent *ev) {
         }
     }
     if (ev->button == 3) {
-        Client *c = hit(z, ev->x_root, ev->y_root);
+        Client *c = hit(z, m, lx, ly);
         if ((ev->state & Mod4Mask) && c) {
             raise_client(z, c);
             c = &z->clients[z->nclients - 1];
             z->focused = c->window; XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
             redraw(z);
             z->resizing = 1; z->resize_win = c->window;
+            z->resize_mon = (int)(m - z->monitors);
             z->resize_sx = ev->x_root; z->resize_sy = ev->y_root;
             z->resize_cw0 = c->cw;     z->resize_ch0 = c->ch;
             XGrabPointer(z->dpy, z->overlay, True, PointerMotionMask|ButtonReleaseMask,
@@ -357,24 +416,27 @@ static void on_motion(ZWM *z, XMotionEvent *ev) {
     while (XCheckTypedEvent(z->dpy, MotionNotify, &next)) *ev = next.xmotion;
     if (z->moving) {
         Client *c = find(z, z->move_win);
+        Monitor *m = &z->monitors[z->move_mon];
         if (c) {
-            c->cx = z->move_cx + (ev->x_root - z->move_sx) / z->vp.zoom;
-            c->cy = z->move_cy + (ev->y_root - z->move_sy) / z->vp.zoom;
+            c->cx = z->move_cx + (ev->x_root - z->move_sx) / m->vp.zoom;
+            c->cy = z->move_cy + (ev->y_root - z->move_sy) / m->vp.zoom;
             redraw(z);
         }
     } else if (z->resizing) {
         Client *c = find(z, z->resize_win);
+        Monitor *m = &z->monitors[z->resize_mon];
         if (c) {
-            int nw = z->resize_cw0 + (int)((ev->x_root - z->resize_sx) / z->vp.zoom);
-            int nh = z->resize_ch0 + (int)((ev->y_root - z->resize_sy) / z->vp.zoom);
+            int nw = z->resize_cw0 + (int)((ev->x_root - z->resize_sx) / m->vp.zoom);
+            int nh = z->resize_ch0 + (int)((ev->y_root - z->resize_sy) / m->vp.zoom);
             c->cw = nw < 20 ? 20 : nw;
             c->ch = nh < 20 ? 20 : nh;
             park(z, c);
             redraw(z);
         }
     } else if (z->panning) {
-        z->vp.cx = z->pan_vx - (ev->x_root - z->pan_sx) / z->vp.zoom;
-        z->vp.cy = z->pan_vy - (ev->y_root - z->pan_sy) / z->vp.zoom;
+        Monitor *m = &z->monitors[z->pan_mon];
+        m->vp.cx = z->pan_vx - (ev->x_root - z->pan_sx) / m->vp.zoom;
+        m->vp.cy = z->pan_vy - (ev->y_root - z->pan_sy) / m->vp.zoom;
         redraw(z);
     }
 }
@@ -395,14 +457,63 @@ static void on_key(ZWM *z, XKeyEvent *ev) {
     }
 }
 
+/* (Re)builds the monitor list from XRandR. A monitor that matches an
+ * existing one by output name keeps its current pan/zoom; a newly
+ * connected monitor starts centered at the canvas origin, unzoomed. Falls
+ * back to a single monitor spanning the whole root if XRandR reports none
+ * (e.g. a plain Xephyr session with no monitors configured). */
+static void detect_monitors(ZWM *z) {
+    XWindowAttributes ra;
+    if (XGetWindowAttributes(z->dpy, z->root, &ra)) { z->sw = ra.width; z->sh = ra.height; }
+
+    Monitor old[MAX_MONITORS];
+    int nold = z->nmonitors;
+    memcpy(old, z->monitors, sizeof(old));
+
+    XRRMonitorInfo *info = NULL;
+    int n = 0;
+    {
+        int got = 0;
+        XRRMonitorInfo *r = XRRGetMonitors(z->dpy, z->root, True, &got);
+        if (r && got > 0) { info = r; n = got; }
+        else if (r) XRRFreeMonitors(r);
+    }
+    if (n <= 0) n = 1;
+    if (n > MAX_MONITORS) n = MAX_MONITORS;
+    z->nmonitors = n;
+
+    for (int i = 0; i < n; i++) {
+        Monitor *m = &z->monitors[i];
+        if (info) {
+            m->mx = info[i].x; m->my = info[i].y;
+            m->mw = info[i].width; m->mh = info[i].height;
+            char *aname = XGetAtomName(z->dpy, info[i].name);
+            snprintf(m->name, sizeof(m->name), "%s", aname ? aname : "");
+            if (aname) XFree(aname);
+        } else {
+            m->mx = 0; m->my = 0; m->mw = z->sw; m->mh = z->sh;
+            snprintf(m->name, sizeof(m->name), "default");
+        }
+        m->vp.sw = m->mw; m->vp.sh = m->mh;
+
+        int matched = 0;
+        for (int j = 0; j < nold; j++) {
+            if (!strcmp(old[j].name, m->name)) {
+                m->vp.cx = old[j].vp.cx; m->vp.cy = old[j].vp.cy; m->vp.zoom = old[j].vp.zoom;
+                matched = 1; break;
+            }
+        }
+        if (!matched) { m->vp.cx = 0; m->vp.cy = 0; m->vp.zoom = 1.0; }
+    }
+    if (info) XRRFreeMonitors(info);
+}
+
 int main(void) {
-    ZWM z = { .vp = { .zoom = 1.0 } };
+    ZWM z = {0};
 
     if (!(z.dpy = XOpenDisplay(NULL))) { fputs("zzwm: no display\n", stderr); return 1; }
     int scr = DefaultScreen(z.dpy);
     z.root = RootWindow(z.dpy, scr);
-    z.sw = z.vp.sw = DisplayWidth(z.dpy, scr);
-    z.sh = z.vp.sh = DisplayHeight(z.dpy, scr);
 
     XSetErrorHandler(xerr);
     XSelectInput(z.dpy, z.root, SubstructureRedirectMask|SubstructureNotifyMask);
@@ -413,6 +524,9 @@ int main(void) {
     if (!XCompositeQueryExtension(z.dpy, &eb, &ee)) { fputs("zzwm: no XComposite\n", stderr); return 1; }
     if (!XDamageQueryExtension(z.dpy, &z.damage_event, &ee)) { fputs("zzwm: no XDamage\n", stderr); return 1; }
     if (!XRenderQueryExtension(z.dpy, &eb, &ee))    { fputs("zzwm: no XRender\n",    stderr); return 1; }
+    if (!XRRQueryExtension(z.dpy, &z.randr_event, &ee)) { fputs("zzwm: no XRandR\n", stderr); return 1; }
+    XRRSelectInput(z.dpy, z.root, RRScreenChangeNotifyMask);
+    detect_monitors(&z);
 
     for (int i = 0; i < NBINDINGS; i++) {
         Binding *b = &bindings[i];
@@ -455,6 +569,12 @@ int main(void) {
         XNextEvent(z.dpy, &ev);
         if (ev.type == z.damage_event + XDamageNotify) {
             XDamageSubtract(z.dpy, ((XDamageNotifyEvent *)&ev)->damage, None, None);
+            redraw(&z);
+            continue;
+        }
+        if (ev.type == z.randr_event + RRScreenChangeNotify) {
+            XRRUpdateConfiguration(&ev);
+            detect_monitors(&z);
             redraw(&z);
             continue;
         }
