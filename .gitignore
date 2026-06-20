@@ -5,3 +5,7 @@ __pycache__/
 venv/
 *.png
 *.log
+/zzwm
+/zzwm-run
+/zzwm-bar
+/zzwm-help

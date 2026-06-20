@@ -1,5 +1,5 @@
 /*
- * zwm — zooming window manager
+ * ZZWM (Zoe's Zooming Window Manager)
  *
  * Controls
  * --------
@@ -7,14 +7,19 @@
  *   middle-click drag   pan the canvas
  *   left-click window   focus
  *   Super+left-drag     move window on canvas
+ *   Super+right-drag    resize window
  *   Super+Return        spawn xterm
+ *   Super+Space         spawn zzwm-run (app launcher)
+ *   Super+H             spawn zzwm-help (keybinding reference)
  *   Super+Q             close focused window
  *
- * Build:  cc -O2 -o zwm zwm.c -lX11 -lXrender -lXcomposite
- * Test:   Xephyr :1 -screen 1280x800 &
- *         DISPLAY=:1 ./zwm
+ * zzwm-run, zzwm-bar, zzwm-help are separate binaries (utility-apps/).
+ *
+ * Build:  cc -O2 -o zzwm zzwm.c -lX11 -lXrender -lXcomposite
+ * Test:   Xephyr :1 -screen 1280x800 && DISPLAY=:1 ./zzwm
  */
 
+#define _DEFAULT_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,18 +30,35 @@
 #include <X11/extensions/Xdamage.h>
 #include <X11/extensions/Xrender.h>
 
-#define ZOOM_SPEED  1.1
-#define ZOOM_MIN    0.05
-#define ZOOM_MAX    20.0
-#define BG_R        0x1818
-#define BG_G        0x1818
-#define BG_B        0x2222
-#define MAX_CLIENTS 64
+#include "appearance.h"
+
+#define ZOOM_SPEED   1.1
+#define ZOOM_MIN     0.05
+#define ZOOM_MAX     20.0
+#define MAX_CLIENTS  64
+
+typedef enum { ACT_SPAWN, ACT_CLOSE } Action;
 
 typedef struct {
-    \Window window;
+    unsigned int mod;
+    KeySym       keysym;
+    Action       action;
+    const char  *arg;
+    KeyCode      keycode;   /* resolved at startup */
+} Binding;
+
+#define BIND(mod, key, act, arg) { mod, key, act, arg, 0 },
+static Binding bindings[] = {
+#include "config.h"
+};
+#undef BIND
+#define NBINDINGS (int)(sizeof(bindings) / sizeof(bindings[0]))
+
+typedef struct {
+    Window window;
     double cx, cy;
-    int cw, ch, depth; 
+    int cw, ch, depth;
+    int anchor;   /* base window (ANCHOR_NAME, set in config.h) -- can't be closed or moved */
 } Client;
 
 typedef struct {
@@ -51,9 +73,10 @@ typedef struct {
     int       sw, sh;
     Viewport  vp;
     XRenderPictFormat *fmt32, *fmt24;
-    KeyCode   kc_enter, kc_q;
     Client    clients[MAX_CLIENTS];
     int       nclients;
+    Window    overrides[MAX_CLIENTS];
+    int       noverride;
     Window    focused;
     int       damage_event;
     int    panning, pan_sx, pan_sy;
@@ -61,14 +84,12 @@ typedef struct {
     int    moving, move_sx, move_sy;
     double move_cx, move_cy;
     Window move_win;
+    int    resizing, resize_sx, resize_sy, resize_cw0, resize_ch0;
+    Window resize_win;
 } ZWM;
-
-/* ── error handler ────────────────────────────────────────────────────────── */
 
 static int g_other_wm;
 static int xerr(Display *d, XErrorEvent *e) { (void)d; if (e->error_code == BadAccess) g_other_wm = 1; return 0; }
-
-/* ── viewport ─────────────────────────────────────────────────────────────── */
 
 static void to_screen(Viewport *v, double cx, double cy, double *sx, double *sy) {
     *sx = (cx - v->cx) * v->zoom + v->sw / 2.0;
@@ -87,8 +108,6 @@ static void zoom_at(Viewport *v, double sx, double sy, double f) {
     v->cx = cx - (sx - v->sw / 2.0) / v->zoom;
     v->cy = cy - (sy - v->sh / 2.0) / v->zoom;
 }
-
-/* ── client helpers ───────────────────────────────────────────────────────── */
 
 static void srect(Client *c, Viewport *v, int *x, int *y, int *w, int *h) {
     double sx, sy;
@@ -113,6 +132,16 @@ static Client *hit(ZWM *z, int sx, int sy) {
     return NULL;
 }
 
+/* Clients are drawn (and hit-tested) in array order, last = topmost. Moving
+ * a client to the end of the array raises it above everything else. */
+static void raise_client(ZWM *z, Client *c) {
+    int idx = (int)(c - z->clients);
+    if (idx < 0 || idx >= z->nclients - 1) return;
+    Client tmp = *c;
+    for (int i = idx; i < z->nclients - 1; i++) z->clients[i] = z->clients[i + 1];
+    z->clients[z->nclients - 1] = tmp;
+}
+
 static void park(ZWM *z, Client *c) {
     XMoveResizeWindow(z->dpy, c->window, -(c->cw+32), -(c->ch+32), c->cw, c->ch);
 }
@@ -125,9 +154,34 @@ static Client *manage(ZWM *z, Window w) {
     c->window = w;
     to_canvas(&z->vp, a.x, a.y, &c->cx, &c->cy);
     c->cw = a.width; c->ch = a.height; c->depth = a.depth;
+    char *name = NULL;
+    c->anchor = XFetchName(z->dpy, w, &name) && name && !strcmp(name, ANCHOR_NAME);
+    if (name) XFree(name);
+    /* The composited window pixmap includes the X border, so a nonzero
+     * border_width (many toolkits default to 1px) shows up baked into the
+     * rendered window. Strip it -- zzwm draws no decorations of its own. */
+    if (a.border_width) XSetWindowBorderWidth(z->dpy, w, 0);
     park(z, c);
     XDamageCreate(z->dpy, w, XDamageReportNonEmpty);
     return c;
+}
+
+/* Override-redirect windows (menus, tooltips, dropdowns) bypass WM
+ * negotiation but are still caught by CompositeRedirectAutomatic, so they
+ * must be composited too -- at their real screen position, never scaled. */
+static void manage_override(ZWM *z, Window w) {
+    for (int i = 0; i < z->noverride; i++) if (z->overrides[i] == w) return;
+    if (z->noverride == MAX_CLIENTS) return;
+    z->overrides[z->noverride++] = w;
+    XWindowAttributes a;
+    if (XGetWindowAttributes(z->dpy, w, &a) && a.border_width)
+        XSetWindowBorderWidth(z->dpy, w, 0);
+    XDamageCreate(z->dpy, w, XDamageReportNonEmpty);
+}
+
+static void unmanage_override(ZWM *z, Window w) {
+    for (int i = 0; i < z->noverride; i++)
+        if (z->overrides[i] == w) { z->overrides[i] = z->overrides[--z->noverride]; return; }
 }
 
 static void unmanage(ZWM *z, Window w) {
@@ -135,17 +189,16 @@ static void unmanage(ZWM *z, Window w) {
     for (i = 0; i < z->nclients; i++) if (z->clients[i].window == w) break;
     if (i == z->nclients) return;
     z->clients[i] = z->clients[--z->nclients];
-    if (z->move_win == w) { z->moving = 0; z->move_win = 0; }
+    if (z->move_win == w)   { z->moving = 0;   z->move_win = 0; }
+    if (z->resize_win == w) { z->resizing = 0; z->resize_win = 0; }
     if (z->focused == w) {
         z->focused = z->nclients ? z->clients[z->nclients-1].window : 0;
         if (z->focused) XSetInputFocus(z->dpy, z->focused, RevertToPointerRoot, CurrentTime);
     }
 }
 
-/* ── render ───────────────────────────────────────────────────────────────── */
-
 static void redraw(ZWM *z) {
-    XRenderColor bg = { BG_R, BG_G, BG_B, 0xffff };
+    XRenderColor bg = { CANVAS_BG_R * 257, CANVAS_BG_G * 257, CANVAS_BG_B * 257, 0xffff };
     XRectangle rect = { 0, 0, (unsigned short)z->sw, (unsigned short)z->sh };
     XRenderFillRectangles(z->dpy, PictOpSrc, z->overlay_pic, &bg, &rect, 1);
 
@@ -163,7 +216,10 @@ static void redraw(ZWM *z) {
         if (z->vp.zoom != 1.0) {
             XFixed inv = XDoubleToFixed(1.0 / z->vp.zoom);
             XTransform xf = {{{ inv, 0, 0 }, { 0, inv, 0 }, { 0, 0, XDoubleToFixed(1.0) }}};
-            XRenderSetPictureFilter(z->dpy, src, FilterBilinear, NULL, 0);
+            /* Bilinear smooths nicely when shrinking, but blurs when
+             * magnifying -- nearest-neighbor keeps zoomed-in content crisp. */
+            const char *filt = z->vp.zoom > 1.0 ? FilterNearest : FilterBilinear;
+            XRenderSetPictureFilter(z->dpy, src, filt, NULL, 0);
             XRenderSetPictureTransform(z->dpy, src, &xf);
         }
         XRenderComposite(z->dpy, PictOpSrc, src, None, z->overlay_pic,
@@ -171,27 +227,64 @@ static void redraw(ZWM *z) {
         XRenderFreePicture(z->dpy, src);
         XFreePixmap(z->dpy, pix);
     }
+
+    for (int i = 0; i < z->noverride; i++) {
+        Window w = z->overrides[i];
+        XWindowAttributes a;
+        if (!XGetWindowAttributes(z->dpy, w, &a) || a.map_state != IsViewable) continue;
+        if (a.x >= z->sw || a.y >= z->sh || a.x+a.width <= 0 || a.y+a.height <= 0) continue;
+
+        Pixmap pix = XCompositeNameWindowPixmap(z->dpy, w);
+        if (!pix) continue;
+        Picture src = XRenderCreatePicture(z->dpy, pix,
+            a.depth == 32 ? z->fmt32 : z->fmt24, 0, NULL);
+        XRenderComposite(z->dpy, PictOpOver, src, None, z->overlay_pic,
+                         0, 0, 0, 0, a.x, a.y, a.width, a.height);
+        XRenderFreePicture(z->dpy, src);
+        XFreePixmap(z->dpy, pix);
+    }
+
     XFlush(z->dpy);
 }
-
-/* ── event handlers ───────────────────────────────────────────────────────── */
 
 static void on_map(ZWM *z, XMapRequestEvent *ev) {
     XWindowAttributes a;
     if (!XGetWindowAttributes(z->dpy, ev->window, &a)) return;
     if (a.override_redirect) { XMapWindow(z->dpy, ev->window); return; }
-    Client *c = find(z, ev->window); if (!c) c = manage(z, ev->window);
+    Client *c = find(z, ev->window);
+    if (!c && (c = manage(z, ev->window))) {
+        if (c->anchor) {
+            /* Fixed landmark at the canvas origin -- not wherever the
+             * viewport happens to be when it's launched. */
+            c->cx = -c->cw / 2.0;
+            c->cy = -c->ch / 2.0;
+        } else {
+            c->cx = z->vp.cx - c->cw / 2.0;
+            c->cy = z->vp.cy - c->ch / 2.0;
+        }
+    }
     XMapWindow(z->dpy, ev->window);
     if (c) { z->focused = c->window; XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime); }
     redraw(z);
 }
 
 static void on_unmap(ZWM *z, XUnmapEvent *ev) {
-    if (!ev->send_event) { unmanage(z, ev->window); redraw(z); }
+    if (!ev->send_event) {
+        unmanage(z, ev->window); unmanage_override(z, ev->window); redraw(z);
+    }
 }
 
 static void on_destroy(ZWM *z, XDestroyWindowEvent *ev) {
-    unmanage(z, ev->window); redraw(z);
+    unmanage(z, ev->window); unmanage_override(z, ev->window); redraw(z);
+}
+
+/* Override-redirect windows map themselves directly (no MapRequest), so
+ * they're only visible to us via MapNotify. */
+static void on_mapnotify(ZWM *z, XMapEvent *ev) {
+    if (ev->window == z->overlay) return;
+    XWindowAttributes a;
+    if (!XGetWindowAttributes(z->dpy, ev->window, &a)) return;
+    if (a.override_redirect) { manage_override(z, ev->window); redraw(z); }
 }
 
 static void on_configure(ZWM *z, XConfigureRequestEvent *ev) {
@@ -220,8 +313,13 @@ static void on_button(ZWM *z, XButtonEvent *ev) {
     }
     if (ev->button == 1) {
         Client *c = hit(z, ev->x_root, ev->y_root);
-        if (c) { z->focused = c->window; XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime); }
-        if ((ev->state & Mod4Mask) && c) {
+        if (c) {
+            raise_client(z, c);
+            c = &z->clients[z->nclients - 1];
+            z->focused = c->window; XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
+            redraw(z);
+        }
+        if ((ev->state & Mod4Mask) && c && !c->anchor) {
             z->moving = 1; z->move_win = c->window;
             z->move_sx = ev->x_root; z->move_sy = ev->y_root;
             z->move_cx = c->cx;      z->move_cy = c->cy;
@@ -229,11 +327,27 @@ static void on_button(ZWM *z, XButtonEvent *ev) {
                          GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
         }
     }
+    if (ev->button == 3) {
+        Client *c = hit(z, ev->x_root, ev->y_root);
+        if ((ev->state & Mod4Mask) && c) {
+            raise_client(z, c);
+            c = &z->clients[z->nclients - 1];
+            z->focused = c->window; XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
+            redraw(z);
+            z->resizing = 1; z->resize_win = c->window;
+            z->resize_sx = ev->x_root; z->resize_sy = ev->y_root;
+            z->resize_cw0 = c->cw;     z->resize_ch0 = c->ch;
+            XGrabPointer(z->dpy, z->overlay, True, PointerMotionMask|ButtonReleaseMask,
+                         GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+        }
+    }
 }
 
 static void on_release(ZWM *z, XButtonEvent *ev) {
-    if ((ev->button == 2 && z->panning) || (ev->button == 1 && z->moving)) {
-        z->panning = z->moving = 0; z->move_win = 0;
+    if ((ev->button == 2 && z->panning) || (ev->button == 1 && z->moving) ||
+        (ev->button == 3 && z->resizing)) {
+        z->panning = z->moving = z->resizing = 0;
+        z->move_win = z->resize_win = 0;
         XUngrabPointer(z->dpy, CurrentTime);
     }
 }
@@ -248,6 +362,16 @@ static void on_motion(ZWM *z, XMotionEvent *ev) {
             c->cy = z->move_cy + (ev->y_root - z->move_sy) / z->vp.zoom;
             redraw(z);
         }
+    } else if (z->resizing) {
+        Client *c = find(z, z->resize_win);
+        if (c) {
+            int nw = z->resize_cw0 + (int)((ev->x_root - z->resize_sx) / z->vp.zoom);
+            int nh = z->resize_ch0 + (int)((ev->y_root - z->resize_sy) / z->vp.zoom);
+            c->cw = nw < 20 ? 20 : nw;
+            c->ch = nh < 20 ? 20 : nh;
+            park(z, c);
+            redraw(z);
+        }
     } else if (z->panning) {
         z->vp.cx = z->pan_vx - (ev->x_root - z->pan_sx) / z->vp.zoom;
         z->vp.cy = z->pan_vy - (ev->y_root - z->pan_sy) / z->vp.zoom;
@@ -256,17 +380,25 @@ static void on_motion(ZWM *z, XMotionEvent *ev) {
 }
 
 static void on_key(ZWM *z, XKeyEvent *ev) {
-    if (!(ev->state & Mod4Mask)) return;
-    if (ev->keycode == z->kc_enter) system("xterm &");
-    else if (ev->keycode == z->kc_q && z->focused) XDestroyWindow(z->dpy, z->focused);
+    for (int i = 0; i < NBINDINGS; i++) {
+        Binding *b = &bindings[i];
+        if (ev->keycode != b->keycode || (ev->state & b->mod) != b->mod) continue;
+        switch (b->action) {
+        case ACT_SPAWN: system(b->arg); break;
+        case ACT_CLOSE: {
+            Client *c = find(z, z->focused);
+            if (z->focused && (!c || !c->anchor)) XDestroyWindow(z->dpy, z->focused);
+            break;
+        }
+        }
+        return;
+    }
 }
-
-/* ── main ─────────────────────────────────────────────────────────────────── */
 
 int main(void) {
     ZWM z = { .vp = { .zoom = 1.0 } };
 
-    if (!(z.dpy = XOpenDisplay(NULL))) { fputs("zwm: no display\n", stderr); return 1; }
+    if (!(z.dpy = XOpenDisplay(NULL))) { fputs("zzwm: no display\n", stderr); return 1; }
     int scr = DefaultScreen(z.dpy);
     z.root = RootWindow(z.dpy, scr);
     z.sw = z.vp.sw = DisplayWidth(z.dpy, scr);
@@ -275,25 +407,26 @@ int main(void) {
     XSetErrorHandler(xerr);
     XSelectInput(z.dpy, z.root, SubstructureRedirectMask|SubstructureNotifyMask);
     XSync(z.dpy, False);
-    if (g_other_wm) { fputs("zwm: another WM running\n", stderr); return 1; }
+    if (g_other_wm) { fputs("zzwm: another WM running\n", stderr); return 1; }
 
     int eb, ee;
-    if (!XCompositeQueryExtension(z.dpy, &eb, &ee)) { fputs("zwm: no XComposite\n", stderr); return 1; }
-    if (!XDamageQueryExtension(z.dpy, &z.damage_event, &ee)) { fputs("zwm: no XDamage\n", stderr); return 1; }
-    if (!XRenderQueryExtension(z.dpy, &eb, &ee))    { fputs("zwm: no XRender\n",    stderr); return 1; }
+    if (!XCompositeQueryExtension(z.dpy, &eb, &ee)) { fputs("zzwm: no XComposite\n", stderr); return 1; }
+    if (!XDamageQueryExtension(z.dpy, &z.damage_event, &ee)) { fputs("zzwm: no XDamage\n", stderr); return 1; }
+    if (!XRenderQueryExtension(z.dpy, &eb, &ee))    { fputs("zzwm: no XRender\n",    stderr); return 1; }
 
-    z.kc_enter = XKeysymToKeycode(z.dpy, XK_Return);
-    z.kc_q     = XKeysymToKeycode(z.dpy, XK_q);
-    XGrabKey(z.dpy, z.kc_enter, Mod4Mask, z.root, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(z.dpy, z.kc_q,     Mod4Mask, z.root, True, GrabModeAsync, GrabModeAsync);
+    for (int i = 0; i < NBINDINGS; i++) {
+        Binding *b = &bindings[i];
+        b->keycode = XKeysymToKeycode(z.dpy, b->keysym);
+        XGrabKey(z.dpy, b->keycode, b->mod, z.root, True, GrabModeAsync, GrabModeAsync);
+    }
 
     XCompositeRedirectSubwindows(z.dpy, z.root, CompositeRedirectAutomatic);
     z.overlay = XCompositeGetOverlayWindow(z.dpy, z.root);
     XSelectInput(z.dpy, z.overlay, ButtonPressMask|ButtonReleaseMask|PointerMotionMask|KeyPressMask);
     Cursor cur = XCreateFontCursor(z.dpy, XC_left_ptr);
     XDefineCursor(z.dpy, z.overlay, cur); XFreeCursor(z.dpy, cur);
-    int btns[] = { 1, 2, 4, 5 };
-    for (int i = 0; i < 4; i++)
+    int btns[] = { 1, 2, 3, 4, 5 };
+    for (int i = 0; i < 5; i++)
         XGrabButton(z.dpy, btns[i], AnyModifier, z.overlay, True,
                     ButtonPressMask, GrabModeAsync, GrabModeAsync, None, None);
 
@@ -309,8 +442,10 @@ int main(void) {
     for (unsigned i = 0; i < n; i++) {
         XWindowAttributes a;
         if (ch[i] != z.overlay && XGetWindowAttributes(z.dpy, ch[i], &a)
-                && a.map_state == IsViewable && !a.override_redirect)
-            manage(&z, ch[i]);
+                && a.map_state == IsViewable) {
+            if (a.override_redirect) manage_override(&z, ch[i]);
+            else                      manage(&z, ch[i]);
+        }
     }
     if (ch) XFree(ch);
     redraw(&z);
@@ -325,13 +460,14 @@ int main(void) {
         }
         switch (ev.type) {
         case MapRequest:       on_map(&z, &ev.xmaprequest);             break;
+        case MapNotify:        on_mapnotify(&z, &ev.xmap);              break;
         case UnmapNotify:      on_unmap(&z, &ev.xunmap);                break;
         case DestroyNotify:    on_destroy(&z, &ev.xdestroywindow);      break;
         case ConfigureRequest: on_configure(&z, &ev.xconfigurerequest); break;
         case ButtonPress:      on_button(&z, &ev.xbutton);              break;
         case ButtonRelease:    on_release(&z, &ev.xbutton);             break;
         case MotionNotify:     on_motion(&z, &ev.xmotion);              break;
-        case KeyPress:         on_key(&z, &ev.xkey);                    break;
+        case KeyPress:         on_key(&z, &ev.xkey); redraw(&z);        break;
         }
     }
 }
