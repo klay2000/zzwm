@@ -1,10 +1,9 @@
 # ZZWM (Zoe's Zooming Window Manager)
 
-A proof-of-concept X11 window manager where all windows live on an infinite
-2-D canvas. Navigation is spatial: scroll to zoom, drag to pan — no virtual
-desktops.
+A minimal X11 window manager where all windows live on an infinite
+2-D canvas. Navigation is spatial: scroll to zoom, drag to pan.
 
-Four binaries: `zzwm` (the window manager) plus three small utility apps in
+Four binaries: `zzwm` (the main window manager) plus three small utility apps in
 `utility-apps/`:
 
 - `zzwm-run` — a small app launcher (Super+Space). A plain client window, so

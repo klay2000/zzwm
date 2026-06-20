@@ -1,19 +1,15 @@
 /*
  * ZZWM (Zoe's Zooming Window Manager)
  *
- * Controls
- * --------
+ * Main Controls
+ * -------------
  *   scroll wheel        zoom in / out (centred on cursor)
  *   middle-click drag   pan the canvas
  *   left-click window   focus
  *   Super+left-drag     move window on canvas
  *   Super+right-drag    resize window
- *   Super+Return        spawn xterm
- *   Super+Space         spawn zzwm-run (app launcher)
- *   Super+H             spawn zzwm-help (keybinding reference)
- *   Super+Q             close focused window
  *
- * zzwm-run, zzwm-bar, zzwm-help are separate binaries (utility-apps/).
+ * See config.h for customizable keybindings to spawn apps and close windows.
  *
  * Build:  cc -O2 -o zzwm zzwm.c -lX11 -lXrender -lXcomposite
  * Test:   Xephyr :1 -screen 1280x800 && DISPLAY=:1 ./zzwm
