@@ -38,7 +38,6 @@
 #define MAX_CLIENTS  64
 
 typedef enum { ACT_SPAWN, ACT_CLOSE } Action;
-
 typedef struct {
     unsigned int mod;
     KeySym       keysym;
@@ -46,7 +45,6 @@ typedef struct {
     const char  *arg;
     KeyCode      keycode;   /* resolved at startup */
 } Binding;
-
 #define BIND(mod, key, act, arg) { mod, key, act, arg, 0 },
 static Binding bindings[] = {
 #include "config.h"
@@ -60,12 +58,10 @@ typedef struct {
     int cw, ch, depth;
     int anchor;   /* base window (ANCHOR_NAME, set in config.h) -- can't be closed or moved */
 } Client;
-
 typedef struct {
     int sw, sh;
     double cx, cy, zoom;
 } Viewport;
-
 typedef struct {
     Display  *dpy;
     Window    root, overlay;
@@ -241,18 +237,41 @@ static void unmanage(ZWM *z, Window w) {
     }
 }
 
+/* Shared tail of both redraw() loops: name the window's pixmap, wrap it in
+ * a Picture, optionally apply the inverse-zoom transform (client windows
+ * only -- override-redirect popups are always drawn at native scale), then
+ * composite into the overlay and free the temporaries. zoom <= 0 means no
+ * transform/filter is applied. */
+static void composite_window(ZWM *z, Window w, int depth, double zoom, int op,
+                              int sx, int sy, int sw, int sh) {
+    Pixmap pix = XCompositeNameWindowPixmap(z->dpy, w);
+    if (!pix) return;
+    Picture src = XRenderCreatePicture(z->dpy, pix,
+        depth == 32 ? z->fmt32 : z->fmt24, 0, NULL);
+    if (zoom > 0 && zoom != 1.0) {
+        XFixed inv = XDoubleToFixed(1.0 / zoom);
+        XTransform xf = {{{ inv, 0, 0 }, { 0, inv, 0 }, { 0, 0, XDoubleToFixed(1.0) }}};
+        /* Bilinear smooths nicely when shrinking, but blurs when
+         * magnifying -- nearest-neighbor keeps zoomed-in content crisp. */
+        const char *filt = zoom > 1.0 ? FilterNearest : FilterBilinear;
+        XRenderSetPictureFilter(z->dpy, src, filt, NULL, 0);
+        XRenderSetPictureTransform(z->dpy, src, &xf);
+    }
+    XRenderComposite(z->dpy, op, src, None, z->overlay_pic, 0, 0, 0, 0, sx, sy, sw, sh);
+    XRenderFreePicture(z->dpy, src);
+    XFreePixmap(z->dpy, pix);
+}
+
 static void redraw(ZWM *z) {
     XRenderColor bg = { CANVAS_BG_R * 257, CANVAS_BG_G * 257, CANVAS_BG_B * 257, 0xffff };
     XRectangle rect = { 0, 0, (unsigned short)z->sw, (unsigned short)z->sh };
     XRenderFillRectangles(z->dpy, PictOpSrc, z->overlay_pic, &bg, &rect, 1);
-
     XRenderColor border_col = { BORDER_R * 257, BORDER_G * 257, BORDER_B * 257, 0xffff };
 
     for (int i = 0; i < z->nclients; i++) {
         Client *c = &z->clients[i];
         int sx, sy, sw, sh;
         srect(c, &z->vp, &sx, &sy, &sw, &sh);
-
         /* Border scales with zoom like the window itself, so it stays
          * proportional whether you're zoomed in or out. */
         int bw = (int)(BORDER_THICKNESS * z->vp.zoom + 0.5);
@@ -263,43 +282,15 @@ static void redraw(ZWM *z) {
                                   (unsigned short)bsw, (unsigned short)bsh };
             XRenderFillRectangles(z->dpy, PictOpSrc, z->overlay_pic, &border_col, &brect, 1);
         }
-
-        Pixmap pix = XCompositeNameWindowPixmap(z->dpy, c->window);
-        if (!pix) continue;
-        Picture src = XRenderCreatePicture(z->dpy, pix,
-            c->depth == 32 ? z->fmt32 : z->fmt24, 0, NULL);
-
-        if (z->vp.zoom != 1.0) {
-            XFixed inv = XDoubleToFixed(1.0 / z->vp.zoom);
-            XTransform xf = {{{ inv, 0, 0 }, { 0, inv, 0 }, { 0, 0, XDoubleToFixed(1.0) }}};
-            /* Bilinear smooths nicely when shrinking, but blurs when
-             * magnifying -- nearest-neighbor keeps zoomed-in content crisp. */
-            const char *filt = z->vp.zoom > 1.0 ? FilterNearest : FilterBilinear;
-            XRenderSetPictureFilter(z->dpy, src, filt, NULL, 0);
-            XRenderSetPictureTransform(z->dpy, src, &xf);
-        }
-        XRenderComposite(z->dpy, PictOpSrc, src, None, z->overlay_pic,
-                         0, 0, 0, 0, sx, sy, sw, sh);
-        XRenderFreePicture(z->dpy, src);
-        XFreePixmap(z->dpy, pix);
+        composite_window(z, c->window, c->depth, z->vp.zoom, PictOpSrc, sx, sy, sw, sh);
     }
-
     for (int i = 0; i < z->noverride; i++) {
         Window w = z->overrides[i];
         XWindowAttributes a;
         if (!XGetWindowAttributes(z->dpy, w, &a) || a.map_state != IsViewable) continue;
         if (a.x >= z->sw || a.y >= z->sh || a.x+a.width <= 0 || a.y+a.height <= 0) continue;
-
-        Pixmap pix = XCompositeNameWindowPixmap(z->dpy, w);
-        if (!pix) continue;
-        Picture src = XRenderCreatePicture(z->dpy, pix,
-            a.depth == 32 ? z->fmt32 : z->fmt24, 0, NULL);
-        XRenderComposite(z->dpy, PictOpOver, src, None, z->overlay_pic,
-                         0, 0, 0, 0, a.x, a.y, a.width, a.height);
-        XRenderFreePicture(z->dpy, src);
-        XFreePixmap(z->dpy, pix);
+        composite_window(z, w, a.depth, 0, PictOpOver, a.x, a.y, a.width, a.height);
     }
-
     XFlush(z->dpy);
 }
 
@@ -357,6 +348,18 @@ static void on_configure(ZWM *z, XConfigureRequestEvent *ev) {
     }
 }
 
+/* Raises c to the top of the stack, gives it input focus, and redraws.
+ * Returns the client's new (post-raise) pointer, since raise_client()
+ * shuffles the array and invalidates the one passed in. */
+static Client *focus_raise(ZWM *z, Client *c) {
+    raise_client(z, c);
+    c = &z->clients[z->nclients - 1];
+    z->focused = c->window;
+    XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
+    redraw(z);
+    return c;
+}
+
 static void on_button(ZWM *z, XButtonEvent *ev) {
     if (ev->button == 4) { zoom_at(&z->vp, ev->x_root, ev->y_root, ZOOM_SPEED);     redraw(z); return; }
     if (ev->button == 5) { zoom_at(&z->vp, ev->x_root, ev->y_root, 1.0/ZOOM_SPEED); redraw(z); return; }
@@ -368,16 +371,12 @@ static void on_button(ZWM *z, XButtonEvent *ev) {
         return;
     }
     if (ev->button != 1 && ev->button != 3) return;
-
     /* Super+drag: grabbed globally on the root (see main()), so this is a
      * WM gesture regardless of which real window the pointer is over. */
     if (ev->state & Mod4Mask) {
         Client *c = hit(z, ev->x_root, ev->y_root);
         if (!c) return;
-        raise_client(z, c);
-        c = &z->clients[z->nclients - 1];
-        z->focused = c->window; XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
-        redraw(z);
+        c = focus_raise(z, c);
         if (ev->button == 1 && !c->anchor) {
             z->moving = 1; z->move_win = c->window;
             z->move_sx = ev->x_root; z->move_sy = ev->y_root;
@@ -403,12 +402,7 @@ static void on_button(ZWM *z, XButtonEvent *ev) {
      * gesture (drag motion, release) straight to the client, with zero
      * further involvement from us, visible to XInput2 listeners and all. */
     Client *c = find(z, ev->window);
-    if (c) {
-        raise_client(z, c);
-        c = &z->clients[z->nclients - 1];
-        z->focused = c->window; XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
-        redraw(z);
-    }
+    if (c) focus_raise(z, c);
     XAllowEvents(z->dpy, ReplayPointer, ev->time);
 }
 
