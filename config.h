@@ -21,3 +21,11 @@ BIND(Mod4Mask, XK_Return, ACT_SPAWN, "xterm &")
 BIND(Mod4Mask, XK_space,  ACT_SPAWN, "zzwm-run &")
 BIND(Mod4Mask, XK_h,      ACT_SPAWN, "zzwm-help &")
 BIND(Mod4Mask, XK_q,      ACT_CLOSE, NULL)
+
+/* Edge snapping during Super-drag move/resize: an edge within SNAP_DIST
+ * canvas units (zoom-independent, like window width/height) of another
+ * window's edge locks onto it, leaving SNAP_GAP units between them when
+ * snapped side-by-side. SNAP_ENABLED 0 disables it. */
+#define SNAP_ENABLED 1
+#define SNAP_DIST    12
+#define SNAP_GAP     10

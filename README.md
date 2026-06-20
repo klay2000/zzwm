@@ -23,8 +23,8 @@ Four binaries: `zzwm` (the main window manager) plus three small utility apps in
 | Scroll wheel | Zoom in / out, centred on cursor |
 | Middle-click drag | Pan the canvas |
 | Left-click window | Focus (and raise to top) |
-| Super + left-drag | Move window on canvas (no-op on the base window) |
-| Super + right-drag | Resize window |
+| Super + left-drag | Move window on canvas (no-op on the base window; snaps to other windows' edges, see Configuration) |
+| Super + right-drag | Resize window (also snaps) |
 | Super + Return | Spawn xterm |
 | Super + Space | Spawn zzwm-run (type a command, Enter to launch) |
 | Super + H | Spawn zzwm-help (keybinding reference) |
@@ -42,6 +42,11 @@ Edit `config.h` and rebuild to change functionality:
   `BIND(Mod4Mask, XK_Return, ACT_SPAWN, "xterm &")`. Available actions:
   `ACT_SPAWN` (run `arg` as a shell command), `ACT_CLOSE` (close the focused
   window).
+- `SNAP_ENABLED` — set to `0` to disable edge snapping entirely. Default `1`.
+- `SNAP_DIST` — how close (in canvas/native pixels, independent of zoom) an
+  edge has to get to another window's edge before it snaps. Default `12`.
+- `SNAP_GAP` — space (same units) left between two windows when they snap
+  side-by-side instead of sitting flush. Default `0`.
 
 No changes to `zzwm.c` are needed for either.
 

@@ -9,7 +9,7 @@ BINDIR  = $(DESTDIR)$(PREFIX)/bin
 all: zzwm zzwm-run zzwm-bar zzwm-help
 
 zzwm: zzwm.c config.h appearance.h
-	$(CC) $(CFLAGS) -o $@ $< -lX11 -lXrender -lXcomposite -lXdamage -lXfixes -lXi
+	$(CC) $(CFLAGS) -o $@ $< -lX11 -lXrender -lXcomposite -lXdamage -lXfixes -lXi -lm
 
 zzwm-run: $(U)/runner.c appearance.h
 	$(CC) $(CFLAGS) -o $@ $< -lX11
