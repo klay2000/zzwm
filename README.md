@@ -147,6 +147,23 @@ of the viewport, and ignores `Super+Q` and `Super+left-drag` on it (the
 `zzwm.c` uses, so its listing always reflects the real configuration rather
 than a separately maintained copy.
 
+**Click passthrough** (the same technique [InfiniteGlass](https://github.com/redhog/InfiniteGlass)
+uses): clicks are never synthesized. The Composite overlay's input shape is
+set to empty (`XFixesSetWindowShapeRegion`), so it's fully click-through;
+`XI_RawMotion`, selected globally on the root, drives `on_hover()`, which
+continuously parks whichever client is visually under the real cursor at the
+matching real screen position (inverting the canvas transform on every
+event, so drags stay pixel-correct at any zoom level) and raises it. A
+plain click is then a genuine `ButtonPress` landing on that real window via
+ordinary X routing — caught by a synchronous passive grab in `manage()`
+just long enough to do focus+raise bookkeeping, then replayed
+(`XAllowEvents(ReplayPointer)`) so the X server delivers it for real. Its
+own implicit grab then carries the rest of the gesture (drag motion,
+release) straight to the client with no further WM involvement, which is
+also why it works for XInput2-only clients, not just core-protocol ones.
+Super-modified gestures (move/resize) and pan/zoom are grabbed globally on
+the root instead, so they never compete with this.
+
 ```
 scroll / pan → Viewport(cx, cy, zoom) → redraw()
                                               │
@@ -160,10 +177,7 @@ scroll / pan → Viewport(cx, cy, zoom) → redraw()
 
 ## Known limitations
 
-- Mouse clicks (and the equivalent for `zzwm-help`'s "click to close") never
-  reach client windows at all — zzwm grabs every pointer button on its
-  overlay window (`AnyModifier`), so only keyboard input (which follows
-  focus) gets through to the focused client.
+- `zzwm-help` only closes on a keypress, not a click.
 - Single monitor only.
 - Windows with non-standard visuals (depth ≠ 24/32) are skipped.
 - Max 64 managed windows (`MAX_CLIENTS`).

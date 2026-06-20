@@ -12,7 +12,7 @@
  *
  * See config.h for customizable keybindings to spawn apps and close windows.
  *
- * Build:  cc -O2 -o zzwm zzwm.c -lX11 -lXrender -lXcomposite
+ * Build:  cc -O2 -o zzwm zzwm.c -lX11 -lXrender -lXcomposite -lXdamage -lXfixes -lXi
  * Test:   Xephyr :1 -screen 1280x800 && DISPLAY=:1 ./zzwm
  */
 
@@ -25,6 +25,9 @@
 #include <X11/keysym.h>
 #include <X11/extensions/Xcomposite.h>
 #include <X11/extensions/Xdamage.h>
+#include <X11/extensions/shape.h>
+#include <X11/extensions/Xfixes.h>
+#include <X11/extensions/XInput2.h>
 #include <X11/extensions/Xrender.h>
 
 #include "appearance.h"
@@ -76,6 +79,8 @@ typedef struct {
     int       noverride;
     Window    focused;
     int       damage_event;
+    int       xi_opcode;
+    Window    hover_win;   /* client currently parked under the real cursor */
     int    panning, pan_sx, pan_sy;
     double pan_vx, pan_vy;
     int    moving, move_sx, move_sy;
@@ -83,9 +88,6 @@ typedef struct {
     Window move_win;
     int    resizing, resize_sx, resize_sy, resize_cw0, resize_ch0;
     Window resize_win;
-    int          passthrough;
-    unsigned int passthrough_button;
-    Window       passthrough_win;
 } ZWM;
 
 static int g_other_wm;
@@ -132,9 +134,10 @@ static Client *hit(ZWM *z, int sx, int sy) {
     return NULL;
 }
 
-/* Override-redirect windows (menus, tooltips) are drawn at their real
- * screen position (see redraw()), so hit-testing them is a plain
- * unscaled rectangle test against their current geometry. */
+/* Override-redirect windows (menus, tooltips) are drawn -- and already sit,
+ * for real, at their real screen position (see redraw()), so hit-testing
+ * them is a plain unscaled rectangle test against their current geometry.
+ * Used by on_hover() to avoid parking a client on top of a popup. */
 static Window hit_override(ZWM *z, int sx, int sy, XWindowAttributes *out) {
     for (int i = z->noverride - 1; i >= 0; i--) {
         Window w = z->overrides[i];
@@ -150,45 +153,15 @@ static Window hit_override(ZWM *z, int sx, int sy, XWindowAttributes *out) {
 
 /* zzwm draws every client window scaled/panned by the canvas transform, but
  * the real window itself sits parked off-screen at its native size (see
- * park()) -- so a screen-space click can't be delivered to it by ordinary
- * X event routing the way it would on a normal (non-compositing) WM. To
- * make clicks land on the right pixel of the actual window, invert the
- * canvas transform to get a canvas point, then subtract the window's
+ * park()) -- so a screen-space point can't be delivered to it by ordinary
+ * X event routing the way it would on a normal (non-compositing) WM. Invert
+ * the canvas transform to get a canvas point, then subtract the window's
  * canvas-space origin to get a window-local pixel. */
 static void to_client_local(Client *c, Viewport *v, int sx, int sy, int *wx, int *wy) {
     double cx, cy;
     to_canvas(v, sx, sy, &cx, &cy);
     *wx = (int)(cx - c->cx);
     *wy = (int)(cy - c->cy);
-}
-
-/* Synthesize an input event aimed at a specific window/coordinate, since
- * the real pointer position on screen rarely matches where the target
- * window thinks it is (see to_client_local() above). type is ButtonPress,
- * ButtonRelease, or MotionNotify; button is ignored for MotionNotify. */
-static void send_input(ZWM *z, int type, Window target, int wx, int wy,
-                        int x_root, int y_root, unsigned int button,
-                        unsigned int state, Time time) {
-    XEvent ev;
-    memset(&ev, 0, sizeof(ev));
-    if (type == MotionNotify) {
-        ev.xmotion.type = MotionNotify;
-        ev.xmotion.window = target;     ev.xmotion.root = z->root;
-        ev.xmotion.x = wx;              ev.xmotion.y = wy;
-        ev.xmotion.x_root = x_root;     ev.xmotion.y_root = y_root;
-        ev.xmotion.state = state;       ev.xmotion.time = time;
-        ev.xmotion.same_screen = True;
-        XSendEvent(z->dpy, target, False, PointerMotionMask, &ev);
-    } else {
-        ev.xbutton.type = type;
-        ev.xbutton.window = target;     ev.xbutton.root = z->root;
-        ev.xbutton.x = wx;              ev.xbutton.y = wy;
-        ev.xbutton.x_root = x_root;     ev.xbutton.y_root = y_root;
-        ev.xbutton.state = state;       ev.xbutton.button = button; ev.xbutton.time = time;
-        ev.xbutton.same_screen = True;
-        XSendEvent(z->dpy, target, False,
-                   type == ButtonPress ? ButtonPressMask : ButtonReleaseMask, &ev);
-    }
 }
 
 /* Clients are drawn (and hit-tested) in array order, last = topmost. Moving
@@ -221,6 +194,17 @@ static Client *manage(ZWM *z, Window w) {
      * rendered window. Strip it -- zzwm draws no decorations of its own. */
     if (a.border_width) XSetWindowBorderWidth(z->dpy, w, 0);
     park(z, c);
+    /* Passive, synchronous grab: on_hover() keeps this window parked under
+     * the real cursor whenever it's the visual hit-target, so a plain click
+     * (no modifier -- Super-drag is grabbed globally on the root instead)
+     * lands for real on this exact window. on_button() does its focus+raise
+     * bookkeeping and replays the event, letting the X server deliver the
+     * genuine press -- and everything that follows it (drag motion,
+     * release) -- straight to the client via its own implicit grab. */
+    XGrabButton(z->dpy, Button1, 0, w, False, ButtonPressMask,
+                GrabModeSync, GrabModeAsync, None, None);
+    XGrabButton(z->dpy, Button3, 0, w, False, ButtonPressMask,
+                GrabModeSync, GrabModeAsync, None, None);
     XDamageCreate(z->dpy, w, XDamageReportNonEmpty);
     return c;
 }
@@ -239,9 +223,6 @@ static void manage_override(ZWM *z, Window w) {
 }
 
 static void unmanage_override(ZWM *z, Window w) {
-    if (z->passthrough_win == w) {
-        z->passthrough = 0; z->passthrough_win = 0; XUngrabPointer(z->dpy, CurrentTime);
-    }
     for (int i = 0; i < z->noverride; i++)
         if (z->overrides[i] == w) { z->overrides[i] = z->overrides[--z->noverride]; return; }
 }
@@ -253,9 +234,7 @@ static void unmanage(ZWM *z, Window w) {
     z->clients[i] = z->clients[--z->nclients];
     if (z->move_win == w)   { z->moving = 0;   z->move_win = 0; }
     if (z->resize_win == w) { z->resizing = 0; z->resize_win = 0; }
-    if (z->passthrough_win == w) {
-        z->passthrough = 0; z->passthrough_win = 0; XUngrabPointer(z->dpy, CurrentTime);
-    }
+    if (z->hover_win == w)  z->hover_win = 0;
     if (z->focused == w) {
         z->focused = z->nclients ? z->clients[z->nclients-1].window : 0;
         if (z->focused) XSetInputFocus(z->dpy, z->focused, RevertToPointerRoot, CurrentTime);
@@ -388,55 +367,49 @@ static void on_button(ZWM *z, XButtonEvent *ev) {
                      GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
         return;
     }
-    if (ev->button == 1 || ev->button == 3) {
+    if (ev->button != 1 && ev->button != 3) return;
+
+    /* Super+drag: grabbed globally on the root (see main()), so this is a
+     * WM gesture regardless of which real window the pointer is over. */
+    if (ev->state & Mod4Mask) {
         Client *c = hit(z, ev->x_root, ev->y_root);
-        if (c) {
-            raise_client(z, c);
-            c = &z->clients[z->nclients - 1];
-            z->focused = c->window; XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
-            redraw(z);
-        }
-        if (ev->button == 1 && (ev->state & Mod4Mask) && c && !c->anchor) {
+        if (!c) return;
+        raise_client(z, c);
+        c = &z->clients[z->nclients - 1];
+        z->focused = c->window; XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
+        redraw(z);
+        if (ev->button == 1 && !c->anchor) {
             z->moving = 1; z->move_win = c->window;
             z->move_sx = ev->x_root; z->move_sy = ev->y_root;
             z->move_cx = c->cx;      z->move_cy = c->cy;
-            XGrabPointer(z->dpy, z->overlay, True, PointerMotionMask|ButtonReleaseMask,
-                         GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
-            return;
-        }
-        if (ev->button == 3 && (ev->state & Mod4Mask) && c) {
+        } else if (ev->button == 3) {
             z->resizing = 1; z->resize_win = c->window;
             z->resize_sx = ev->x_root; z->resize_sy = ev->y_root;
             z->resize_cw0 = c->cw;     z->resize_ch0 = c->ch;
-            XGrabPointer(z->dpy, z->overlay, True, PointerMotionMask|ButtonReleaseMask,
-                         GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+        } else {
             return;
         }
-
-        /* Not a WM gesture (move/resize) -- forward the click straight
-         * through to whatever's visually under the pointer: a client,
-         * translated through the canvas transform, or an override-redirect
-         * popup at its real screen position. */
-        Window target; int wx, wy;
-        if (c) {
-            to_client_local(c, &z->vp, ev->x_root, ev->y_root, &wx, &wy);
-            target = c->window;
-        } else {
-            XWindowAttributes a;
-            target = hit_override(z, ev->x_root, ev->y_root, &a);
-            if (!target) return;
-            wx = ev->x_root - a.x; wy = ev->y_root - a.y;
-        }
-        z->passthrough = 1; z->passthrough_win = target; z->passthrough_button = ev->button;
-        /* Explicit grab, same as the move/resize/pan gestures above --
-         * the passive XGrabButton at the bottom of main() only asks for
-         * ButtonPressMask, so without this, ButtonRelease/MotionNotify for
-         * this click aren't guaranteed to reach us at all. */
         XGrabPointer(z->dpy, z->overlay, True, PointerMotionMask|ButtonReleaseMask,
                      GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
-        send_input(z, ButtonPress, target, wx, wy, ev->x_root, ev->y_root,
-                   ev->button, ev->state, ev->time);
+        return;
     }
+
+    /* Plain click: this is the per-client synchronous grab from manage()
+     * firing, with ev->window the real client (on_hover() keeps whatever's
+     * under the cursor parked there). Do the focus+raise bookkeeping, then
+     * replay the event -- the X server re-does its own hit-test, finds the
+     * same window still sitting right there, and delivers the genuine
+     * press for real. Its own implicit grab then carries the rest of the
+     * gesture (drag motion, release) straight to the client, with zero
+     * further involvement from us, visible to XInput2 listeners and all. */
+    Client *c = find(z, ev->window);
+    if (c) {
+        raise_client(z, c);
+        c = &z->clients[z->nclients - 1];
+        z->focused = c->window; XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
+        redraw(z);
+    }
+    XAllowEvents(z->dpy, ReplayPointer, ev->time);
 }
 
 static void on_release(ZWM *z, XButtonEvent *ev) {
@@ -444,23 +417,6 @@ static void on_release(ZWM *z, XButtonEvent *ev) {
         (ev->button == 3 && z->resizing)) {
         z->panning = z->moving = z->resizing = 0;
         z->move_win = z->resize_win = 0;
-        XUngrabPointer(z->dpy, CurrentTime);
-    } else if (z->passthrough && ev->button == z->passthrough_button) {
-        Window target = z->passthrough_win;
-        int wx, wy;
-        Client *c = find(z, target);
-        if (c) {
-            to_client_local(c, &z->vp, ev->x_root, ev->y_root, &wx, &wy);
-        } else {
-            XWindowAttributes a;
-            if (!XGetWindowAttributes(z->dpy, target, &a)) {
-                z->passthrough = 0; XUngrabPointer(z->dpy, CurrentTime); return;
-            }
-            wx = ev->x_root - a.x; wy = ev->y_root - a.y;
-        }
-        send_input(z, ButtonRelease, target, wx, wy, ev->x_root, ev->y_root,
-                   ev->button, ev->state, ev->time);
-        z->passthrough = 0; z->passthrough_win = 0;
         XUngrabPointer(z->dpy, CurrentTime);
     }
 }
@@ -489,22 +445,49 @@ static void on_motion(ZWM *z, XMotionEvent *ev) {
         z->vp.cx = z->pan_vx - (ev->x_root - z->pan_sx) / z->vp.zoom;
         z->vp.cy = z->pan_vy - (ev->y_root - z->pan_sy) / z->vp.zoom;
         redraw(z);
-    } else if (z->passthrough) {
-        Window target = z->passthrough_win;
-        Client *c = find(z, target);
-        int wx, wy;
-        if (c) {
-            to_client_local(c, &z->vp, ev->x_root, ev->y_root, &wx, &wy);
-        } else {
-            XWindowAttributes a;
-            if (!XGetWindowAttributes(z->dpy, target, &a)) {
-                z->passthrough = 0; XUngrabPointer(z->dpy, CurrentTime); return;
-            }
-            wx = ev->x_root - a.x; wy = ev->y_root - a.y;
-        }
-        send_input(z, MotionNotify, target, wx, wy, ev->x_root, ev->y_root,
-                   0, ev->state, ev->time);
     }
+}
+
+/* Driven by XI_RawMotion (selected globally on the root in main()), which
+ * fires on every real pointer move regardless of which window currently
+ * owns any grab -- exactly the property that lets this run continuously
+ * during a drag without disturbing whatever real, implicit grab is
+ * carrying that drag's events to a client (see on_button()).
+ *
+ * Keeps the client visually under the cursor's real window parked at the
+ * matching real screen position (and raised), so plain X event routing --
+ * not synthetic events -- delivers input to the right native pixel. This
+ * also keeps drags zoom-correct: re-deriving the window-local point from
+ * the live inverse canvas transform on every motion means a screen-pixel
+ * mouse delta still becomes the right native-pixel delta at any zoom. */
+static void on_hover(ZWM *z) {
+    Window root_ret, child_ret;
+    int root_x, root_y, win_x, win_y;
+    unsigned int mask;
+    if (!XQueryPointer(z->dpy, z->root, &root_ret, &child_ret,
+                        &root_x, &root_y, &win_x, &win_y, &mask))
+        return;
+
+    XWindowAttributes a;
+    Client *c = hit_override(z, root_x, root_y, &a) ? NULL : hit(z, root_x, root_y);
+    if (c && z->hover_win && c->window != z->hover_win) {
+        Client *prev = find(z, z->hover_win);
+        if (prev) park(z, prev);
+    }
+    if (!c) {
+        if (z->hover_win) {
+            Client *prev = find(z, z->hover_win);
+            if (prev) park(z, prev);
+            z->hover_win = 0;
+        }
+        return;
+    }
+
+    int wx, wy;
+    to_client_local(c, &z->vp, root_x, root_y, &wx, &wy);
+    XMoveWindow(z->dpy, c->window, root_x - wx, root_y - wy);
+    XRaiseWindow(z->dpy, c->window);
+    z->hover_win = c->window;
 }
 
 static void on_key(ZWM *z, XKeyEvent *ev) {
@@ -541,6 +524,11 @@ int main(void) {
     if (!XCompositeQueryExtension(z.dpy, &eb, &ee)) { fputs("zzwm: no XComposite\n", stderr); return 1; }
     if (!XDamageQueryExtension(z.dpy, &z.damage_event, &ee)) { fputs("zzwm: no XDamage\n", stderr); return 1; }
     if (!XRenderQueryExtension(z.dpy, &eb, &ee))    { fputs("zzwm: no XRender\n",    stderr); return 1; }
+    if (!XFixesQueryExtension(z.dpy, &eb, &ee))     { fputs("zzwm: no XFixes\n",     stderr); return 1; }
+    if (!XQueryExtension(z.dpy, "XInputExtension", &z.xi_opcode, &eb, &ee)) {
+        fputs("zzwm: no XInput2\n", stderr); return 1;
+    }
+    { int maj = 2, min = 2; XIQueryVersion(z.dpy, &maj, &min); }
 
     for (int i = 0; i < NBINDINGS; i++) {
         Binding *b = &bindings[i];
@@ -548,15 +536,40 @@ int main(void) {
         XGrabKey(z.dpy, b->keycode, b->mod, z.root, True, GrabModeAsync, GrabModeAsync);
     }
 
+    /* Super+move, Super+resize, pan and zoom are pure WM gestures -- grabbed
+     * globally on the root (fires regardless of which real window the
+     * pointer is over) rather than on the overlay. Plain clicks (no
+     * modifier) are deliberately left ungrabbed here: they're caught by the
+     * per-client passive grab in manage() instead, so they can be replayed
+     * straight through to the client (see on_button()). */
+    XGrabButton(z.dpy, Button1, Mod4Mask, z.root, True, ButtonPressMask,
+                GrabModeAsync, GrabModeAsync, None, None);
+    XGrabButton(z.dpy, Button3, Mod4Mask, z.root, True, ButtonPressMask,
+                GrabModeAsync, GrabModeAsync, None, None);
+    int wheel_btns[] = { 2, 4, 5 };
+    for (int i = 0; i < 3; i++)
+        XGrabButton(z.dpy, wheel_btns[i], AnyModifier, z.root, True, ButtonPressMask,
+                    GrabModeAsync, GrabModeAsync, None, None);
+
+    unsigned char ximask[(XI_LASTEVENT + 7) / 8] = {0};
+    XISetMask(ximask, XI_RawMotion);
+    XIEventMask evmask = { XIAllMasterDevices, sizeof(ximask), ximask };
+    XISelectEvents(z.dpy, z.root, &evmask, 1);
+
     XCompositeRedirectSubwindows(z.dpy, z.root, CompositeRedirectAutomatic);
     z.overlay = XCompositeGetOverlayWindow(z.dpy, z.root);
     XSelectInput(z.dpy, z.overlay, ButtonPressMask|ButtonReleaseMask|PointerMotionMask|KeyPressMask);
     Cursor cur = XCreateFontCursor(z.dpy, XC_left_ptr);
     XDefineCursor(z.dpy, z.overlay, cur); XFreeCursor(z.dpy, cur);
-    int btns[] = { 1, 2, 3, 4, 5 };
-    for (int i = 0; i < 5; i++)
-        XGrabButton(z.dpy, btns[i], AnyModifier, z.overlay, True,
-                    ButtonPressMask, GrabModeAsync, GrabModeAsync, None, None);
+    /* Make the overlay (and so the visual, zoomed canvas it draws) fully
+     * input-transparent: with no shape, every plain click/drag/release
+     * passes straight through to whichever real client window on_hover()
+     * has parked under the cursor, just like InfiniteGlass's
+     * overlay_set_input(False). The WM gestures above don't need the
+     * overlay at all, since they're grabbed on the root. */
+    XserverRegion empty = XFixesCreateRegion(z.dpy, NULL, 0);
+    XFixesSetWindowShapeRegion(z.dpy, z.overlay, ShapeInput, 0, 0, empty);
+    XFixesDestroyRegion(z.dpy, empty);
 
     z.fmt32 = XRenderFindStandardFormat(z.dpy, PictStandardARGB32);
     z.fmt24 = XRenderFindStandardFormat(z.dpy, PictStandardRGB24);
@@ -596,6 +609,12 @@ int main(void) {
         case ButtonRelease:    on_release(&z, &ev.xbutton);             break;
         case MotionNotify:     on_motion(&z, &ev.xmotion);              break;
         case KeyPress:         on_key(&z, &ev.xkey); redraw(&z);        break;
+        case GenericEvent:
+            if (ev.xcookie.extension == z.xi_opcode && XGetEventData(z.dpy, &ev.xcookie)) {
+                if (ev.xcookie.evtype == XI_RawMotion) on_hover(&z);
+                XFreeEventData(z.dpy, &ev.xcookie);
+            }
+            break;
         }
     }
 }
