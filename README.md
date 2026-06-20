@@ -87,6 +87,36 @@ Then open windows on `:1`:
 DISPLAY=:1 xterm &
 ```
 
+## Installation
+
+```sh
+make
+sudo make install         # installs to /usr/local/bin
+# or, without root:
+make install PREFIX=~/.local
+```
+
+`zzwm` launches `zzwm-run`/`zzwm-bar`/`zzwm-help` via `system()` (e.g.
+`"zzwm-run &"`), so they must be on `$PATH` for keybindings like Super+Space
+to work — `make install` puts all four binaries in the same directory for
+that reason. `make uninstall` removes them again (respects the same
+`PREFIX`/`DESTDIR`).
+
+To run zzwm as your actual X session window manager, add to `~/.xinitrc`:
+
+```sh
+zzwm-bar &
+exec zzwm
+```
+
+then start X with `startx`. (Test in Xephyr first, per above — zzwm replaces
+whatever WM is currently running on the display, so a bad keybinding config
+could leave you without a way to spawn a terminal.)
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
 ## Architecture
 
 **Non-reparenting WM** — managed windows remain direct children of the root;

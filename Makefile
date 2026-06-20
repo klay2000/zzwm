@@ -1,6 +1,10 @@
 CC      = cc
 CFLAGS  = -O2 -Wall -Wextra -std=c99
 U       = utility-apps
+PREFIX  = /usr/local
+BINDIR  = $(DESTDIR)$(PREFIX)/bin
+
+.PHONY: all clean install uninstall
 
 all: zzwm zzwm-run zzwm-bar zzwm-help
 
@@ -18,3 +22,10 @@ zzwm-help: $(U)/help.c appearance.h config.h
 
 clean:
 	rm -f zzwm zzwm-run zzwm-bar zzwm-help
+
+install: all
+	install -d $(BINDIR)
+	install -m755 zzwm zzwm-run zzwm-bar zzwm-help $(BINDIR)
+
+uninstall:
+	rm -f $(BINDIR)/zzwm $(BINDIR)/zzwm-run $(BINDIR)/zzwm-bar $(BINDIR)/zzwm-help
