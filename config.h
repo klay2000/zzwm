@@ -19,7 +19,7 @@
  *   Super+Q             close focused window
  *   Super+Alt+L         logout (multi-key bind example)
 */
-BIND(Mod4Mask, XK_Return, ACT_SPAWN, "xterm &")
+BIND(Mod4Mask, XK_Return, ACT_SPAWN, "st &")
 BIND(Mod4Mask, XK_space,  ACT_SPAWN, "zzwm-run &")
 BIND(Mod4Mask, XK_h,      ACT_SPAWN, "zzwm-help &")
 BIND(Mod4Mask, XK_q,      ACT_CLOSE, NULL)
@@ -32,6 +32,14 @@ BIND(Mod4Mask|Mod1Mask, XK_l, ACT_SPAWN, "pkill -x zzwm &")
 #define SNAP_ENABLED 1
 #define SNAP_DIST    12
 #define SNAP_GAP     10
+
+/* Idle locking: after IDLE_LOCK_TIMEOUT seconds with no keyboard/mouse input,
+ * IDLE_LOCK_CMD is run once. IDLE_LOCK_TIMEOUT 0 disables idle locking.
+ * IDLE_LOCK_CMD is a shell command -- like the spawn bindings above, end it
+ * with & so it backgrounds instead of blocking the WM (e.g. slock, i3lock,
+ * xtrlock, or a custom script). */
+#define IDLE_LOCK_TIMEOUT 300
+#define IDLE_LOCK_CMD     "dm-tool lock"
 
 /* zzwm-bar (utility-apps/statusbar.c). BAR_CMD is a shell command; each
  * line of its output becomes one centred line in the bar, re-run every

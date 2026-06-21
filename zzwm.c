@@ -22,6 +22,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <sys/select.h>
 #include <X11/Xlib.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
@@ -93,10 +95,24 @@ typedef struct {
     Window move_win;
     int    resizing, resize_sx, resize_sy, resize_cw0, resize_ch0;
     Window resize_win;
+    double last_input;   /* CLOCK_MONOTONIC seconds, updated on any input event */
+    int    idle_fired;   /* IDLE_LOCK_CMD already run for the current idle period */
 } ZWM;
 
 static int g_other_wm;
 static int xerr(Display *d, XErrorEvent *e) { (void)d; if (e->error_code == BadAccess) g_other_wm = 1; return 0; }
+
+static double now_secs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+// called on any real input (key, button, motion) to reset the idle-lock countdown
+static void mark_activity(ZWM *z) {
+    z->last_input = now_secs();
+    z->idle_fired = 0;
+}
 
 static void to_screen(Viewport *v, double cx, double cy, double *sx, double *sy) {
     *sx = (cx - v->cx) * v->zoom + v->sw / 2.0;
@@ -663,9 +679,27 @@ int main(void) {
     }
     if (ch) XFree(ch);
     request_redraw(&z);
+    z.last_input = now_secs();
 
     XEvent ev;
     for (;;) {
+        // idle lock: wait for an X event, but wake up early to check the idle timer so
+        // IDLE_LOCK_CMD fires even while nothing else is happening on the connection
+        if (IDLE_LOCK_TIMEOUT > 0) {
+            int fd = ConnectionNumber(z.dpy);
+            while (!XPending(z.dpy)) {
+                double idle = now_secs() - z.last_input;
+                if (!z.idle_fired && idle >= IDLE_LOCK_TIMEOUT) {
+                    system(IDLE_LOCK_CMD);
+                    z.idle_fired = 1;
+                }
+                double wait = z.idle_fired ? 60.0 : IDLE_LOCK_TIMEOUT - idle;
+                if (wait < 0) wait = 0;
+                struct timeval tv = { (long)wait, (long)((wait - (long)wait) * 1e6) };
+                fd_set fds; FD_ZERO(&fds); FD_SET(fd, &fds);
+                select(fd + 1, &fds, NULL, NULL, &tv);
+            }
+        }
         XNextEvent(z.dpy, &ev);
         if (ev.type == z.damage_event + XDamageNotify) {
             XDamageSubtract(z.dpy, ((XDamageNotifyEvent *)&ev)->damage, None, None);
@@ -678,13 +712,13 @@ int main(void) {
         case UnmapNotify:      on_unmap(&z, &ev.xunmap);                break;
         case DestroyNotify:    on_destroy(&z, &ev.xdestroywindow);      break;
         case ConfigureRequest: on_configure(&z, &ev.xconfigurerequest); break;
-        case ButtonPress:      on_button(&z, &ev.xbutton);              break;
-        case ButtonRelease:    on_release(&z, &ev.xbutton);             break;
-        case MotionNotify:     on_motion(&z, &ev.xmotion);              break;
-        case KeyPress:         on_key(&z, &ev.xkey); request_redraw(&z);        break;
+        case ButtonPress:      mark_activity(&z); on_button(&z, &ev.xbutton);   break;
+        case ButtonRelease:    mark_activity(&z); on_release(&z, &ev.xbutton);  break;
+        case MotionNotify:     mark_activity(&z); on_motion(&z, &ev.xmotion);   break;
+        case KeyPress:         mark_activity(&z); on_key(&z, &ev.xkey); request_redraw(&z); break;
         case GenericEvent:
             if (ev.xcookie.extension == z.xi_opcode && XGetEventData(z.dpy, &ev.xcookie)) {
-                if (ev.xcookie.evtype == XI_RawMotion) on_hover(&z);
+                if (ev.xcookie.evtype == XI_RawMotion) { mark_activity(&z); on_hover(&z); }
                 XFreeEventData(z.dpy, &ev.xcookie);
             } else if (ev.xcookie.extension == z.present_opcode && XGetEventData(z.dpy, &ev.xcookie)) {
                 if (ev.xcookie.evtype == PresentIdleNotify)
