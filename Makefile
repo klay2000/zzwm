@@ -14,7 +14,7 @@ zzwm: zzwm.c config.h appearance.h
 zzwm-run: $(U)/runner.c appearance.h
 	$(CC) $(CFLAGS) -o $@ $< -lX11
 
-zzwm-bar: $(U)/statusbar.c appearance.h
+zzwm-bar: $(U)/statusbar.c appearance.h config.h
 	$(CC) $(CFLAGS) -o $@ $< -lX11
 
 zzwm-help: $(U)/help.c appearance.h config.h

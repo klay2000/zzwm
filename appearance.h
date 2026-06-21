@@ -29,6 +29,9 @@
 #define BORDER_B 0x33
 #define BORDER_THICKNESS 2
 
+/* X font name (XLoadQueryFont) used by zzwm-run and zzwm-bar. */
+#define FONT_NAME "fixed"
+
 static inline unsigned long alloc_color(Display *dpy, Colormap cmap, int r, int g, int b) {
     XColor c = { .red = (unsigned short)(r * 257), .green = (unsigned short)(g * 257),
                  .blue = (unsigned short)(b * 257), .flags = DoRed | DoGreen | DoBlue };

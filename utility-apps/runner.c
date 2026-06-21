@@ -125,7 +125,7 @@ int main(void) {
     XStoreName(a.dpy, a.win, "zzwm-run");
 
     a.gc = XCreateGC(a.dpy, a.win, 0, NULL);
-    a.font = XLoadQueryFont(a.dpy, "fixed");
+    a.font = XLoadQueryFont(a.dpy, FONT_NAME);
     if (a.font) XSetFont(a.dpy, a.gc, a.font->fid);
 
     build_cache(&a);

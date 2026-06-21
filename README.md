@@ -47,6 +47,13 @@ Edit `config.h` and rebuild to change functionality:
   edge has to get to another window's edge before it snaps. Default `12`.
 - `SNAP_GAP` — space (same units) left between two windows when they snap
   side-by-side instead of sitting flush. Default `10`.
+- `BAR_TIME_FORMAT` — `strftime` format for zzwm-bar's clock line.
+- `BAR_HINT` — text shown below the clock in zzwm-bar. Default
+  `"Super+H for help"`.
+- `BAR_CMD` — a shell command; its first line of output is shown as a third
+  line in zzwm-bar, re-run every `BAR_CMD_INTERVAL` seconds. Leave it `""`
+  (the default) to disable that line entirely.
+- `BAR_CMD_INTERVAL` — how often `BAR_CMD` is re-run, in seconds. Default `5`.
 
 No changes to `zzwm.c` are needed for either.
 
@@ -60,6 +67,8 @@ Edit `appearance.h` and rebuild to change aesthetics:
   managed window.
 - `BORDER_THICKNESS` — border thickness in canvas pixels at zoom 1.0 (it
   scales with the window as you zoom). Set to `0` to disable borders.
+- `FONT_NAME` — X font name (`XLoadQueryFont`) used by zzwm-run and
+  zzwm-bar. Default `"fixed"`.
 
 No changes to any `.c` files are needed.
 
