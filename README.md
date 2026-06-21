@@ -11,7 +11,8 @@ Four binaries: `zzwm` (the main window manager) plus three small utility apps in
 - `zzwm-bar` — a minimal status app that doubles as the "base window" (see
   below): zzwm anchors it at the canvas origin (0,0) and won't let it be
   closed or moved, so it acts as a "you are here" reference point as you
-  zoom/pan. Shows a clock and a permanent "Super+H for help" hint.
+  zoom/pan. Its contents are entirely driven by running `BAR_CMD` (see
+  Configuration), one line of output per line shown.
 - `zzwm-help` — a keybinding reference (Super+H). Reads `config.h`'s
   bindings table directly, so it always matches the real configuration; any
   keypress closes it, not a click.
@@ -47,13 +48,10 @@ Edit `config.h` and rebuild to change functionality:
   edge has to get to another window's edge before it snaps. Default `12`.
 - `SNAP_GAP` — space (same units) left between two windows when they snap
   side-by-side instead of sitting flush. Default `10`.
-- `BAR_TIME_FORMAT` — `strftime` format for zzwm-bar's clock line.
-- `BAR_HINT` — text shown below the clock in zzwm-bar. Default
-  `"Super+H for help"`.
-- `BAR_CMD` — a shell command; its first line of output is shown as a third
-  line in zzwm-bar, re-run every `BAR_CMD_INTERVAL` seconds. Leave it `""`
-  (the default) to disable that line entirely.
-- `BAR_CMD_INTERVAL` — how often `BAR_CMD` is re-run, in seconds. Default `5`.
+- `BAR_CMD` — a shell command; each line of its output becomes one centred
+  line in zzwm-bar (window resizes to fit), re-run every `BAR_CMD_INTERVAL`
+  seconds. Defaults to a one-liner that prints a clock and a help hint.
+- `BAR_CMD_INTERVAL` — how often `BAR_CMD` is re-run, in seconds. Default `1`.
 
 No changes to `zzwm.c` are needed for either.
 
