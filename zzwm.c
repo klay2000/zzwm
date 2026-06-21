@@ -103,12 +103,14 @@ static void to_canvas(Viewport *v, double sx, double sy, double *cx, double *cy)
 
 static void zoom_at(Viewport *v, double sx, double sy, double f) {
     double cx, cy, zoom = v->zoom * f;
-    to_canvas(v, sx, sy, &cx, &cy);
+    to_canvas(v, sx, sy, &cx, &cy); // canvas point currently under the cursor
     v->zoom = zoom < ZOOM_MIN ? ZOOM_MIN : zoom > ZOOM_MAX ? ZOOM_MAX : zoom;
+    // re-center the viewport so that same canvas point stays under the cursor at the new zoom
     v->cx = cx - (sx - v->sw / 2.0) / v->zoom;
     v->cy = cy - (sy - v->sh / 2.0) / v->zoom;
 }
 
+// screen-space rect for a client; minimum 1px so zoomed-out windows stay hit-testable
 static void srect(Client *c, Viewport *v, int *x, int *y, int *w, int *h) {
     double sx, sy;
     to_screen(v, c->cx, c->cy, &sx, &sy);
@@ -132,9 +134,7 @@ static Client *hit(ZWM *z, int sx, int sy) {
     return NULL;
 }
 
-/* Override-redirect windows sit at their real screen position (see
- * redraw()), so hit-testing them is a plain unscaled rect test. Used by
- * on_hover() to avoid parking a client on top of a popup. */
+// override-redirect windows sit at real screen coords, so this is an unscaled rect test
 static Window hit_override(ZWM *z, int sx, int sy, XWindowAttributes *out) {
     for (int i = z->noverride - 1; i >= 0; i--) {
         Window w = z->overrides[i];
@@ -148,9 +148,7 @@ static Window hit_override(ZWM *z, int sx, int sy, XWindowAttributes *out) {
     return None;
 }
 
-/* The real window sits parked off-screen at native size (see park()), so a
- * screen point needs the canvas transform inverted, then the window's
- * canvas-space origin subtracted, to become a window-local pixel. */
+// invert the canvas transform, then subtract the window's canvas-space origin -> window-local pixel
 static void to_client_local(Client *c, Viewport *v, int sx, int sy, int *wx, int *wy) {
     double cx, cy;
     to_canvas(v, sx, sy, &cx, &cy);
@@ -158,8 +156,7 @@ static void to_client_local(Client *c, Viewport *v, int sx, int sy, int *wx, int
     *wy = (int)(cy - c->cy);
 }
 
-/* Clients are drawn (and hit-tested) in array order, last = topmost. Moving
- * a client to the end of the array raises it above everything else. */
+// draw/hit-test order follows the array; moving c to the end raises it
 static void raise_client(ZWM *z, Client *c) {
     int idx = (int)(c - z->clients);
     if (idx < 0 || idx >= z->nclients - 1) return;
@@ -168,6 +165,7 @@ static void raise_client(ZWM *z, Client *c) {
     z->clients[z->nclients - 1] = tmp;
 }
 
+// moves the real window off-screen at native size; on_hover() repositions it under the cursor
 static void park(ZWM *z, Client *c) {
     XMoveResizeWindow(z->dpy, c->window, -(c->cw+32), -(c->ch+32), c->cw, c->ch);
 }
@@ -183,15 +181,10 @@ static Client *manage(ZWM *z, Window w) {
     char *name = NULL;
     c->anchor = XFetchName(z->dpy, w, &name) && name && !strcmp(name, ANCHOR_NAME);
     if (name) XFree(name);
-    /* The composited window pixmap includes the X border, so a nonzero
-     * border_width (many toolkits default to 1px) shows up baked into the
-     * rendered window. Strip it -- zzwm draws no decorations of its own. */
-    if (a.border_width) XSetWindowBorderWidth(z->dpy, w, 0);
+    if (a.border_width) XSetWindowBorderWidth(z->dpy, w, 0); // border would otherwise get baked into the composited pixmap
     park(z, c);
-    /* Passive, synchronous grab: on_hover() parks this window under the
-     * cursor whenever it's the hit-target, so a plain click lands here for
-     * real. on_button() does focus+raise then replays the event so the X
-     * server delivers it (and the rest of the drag) straight to the client. */
+    // passive sync grab: on_hover() parks the client under the cursor, then on_button() replays
+    // the press through so X delivers it (and the rest of the drag) straight to the client
     XGrabButton(z->dpy, Button1, 0, w, False, ButtonPressMask,
                 GrabModeSync, GrabModeAsync, None, None);
     XGrabButton(z->dpy, Button3, 0, w, False, ButtonPressMask,
@@ -200,9 +193,7 @@ static Client *manage(ZWM *z, Window w) {
     return c;
 }
 
-/* Override-redirect windows (menus, tooltips, dropdowns) bypass WM
- * negotiation but are still caught by CompositeRedirectAutomatic, so they
- * must be composited too -- at their real screen position, never scaled. */
+// menus/tooltips/dropdowns skip WM negotiation but still get composited, at native screen position
 static void manage_override(ZWM *z, Window w) {
     for (int i = 0; i < z->noverride; i++) if (z->overrides[i] == w) return;
     if (z->noverride == MAX_CLIENTS) return;
@@ -232,10 +223,8 @@ static void unmanage(ZWM *z, Window w) {
     }
 }
 
-/* Shared tail of both redraw() loops: name the window's pixmap, wrap it in a
- * Picture, optionally apply the inverse-zoom transform, composite into the
- * overlay, free temporaries. zoom <= 0 skips the transform/filter
- * (override-redirect popups are always drawn at native scale). */
+// shared tail of both redraw() loops; zoom <= 0 skips the transform (override-redirect popups
+// always draw at native scale)
 static void composite_window(ZWM *z, Window w, int depth, double zoom, int op,
                               int sx, int sy, int sw, int sh) {
     Pixmap pix = XCompositeNameWindowPixmap(z->dpy, w);
@@ -245,9 +234,7 @@ static void composite_window(ZWM *z, Window w, int depth, double zoom, int op,
     if (zoom > 0 && zoom != 1.0) {
         XFixed inv = XDoubleToFixed(1.0 / zoom);
         XTransform xf = {{{ inv, 0, 0 }, { 0, inv, 0 }, { 0, 0, XDoubleToFixed(1.0) }}};
-        /* Bilinear smooths nicely when shrinking, but blurs when
-         * magnifying -- nearest-neighbor keeps zoomed-in content crisp. */
-        const char *filt = zoom > 1.0 ? FilterNearest : FilterBilinear;
+        const char *filt = zoom > 1.0 ? FilterNearest : FilterBilinear; // bilinear blurs when magnifying
         XRenderSetPictureFilter(z->dpy, src, filt, NULL, 0);
         XRenderSetPictureTransform(z->dpy, src, &xf);
     }
@@ -266,9 +253,7 @@ static void redraw(ZWM *z) {
         Client *c = &z->clients[i];
         int sx, sy, sw, sh;
         srect(c, &z->vp, &sx, &sy, &sw, &sh);
-        /* Border scales with zoom like the window itself, so it stays
-         * proportional whether you're zoomed in or out. */
-        int bw = (int)(BORDER_THICKNESS * z->vp.zoom + 0.5);
+        int bw = (int)(BORDER_THICKNESS * z->vp.zoom + 0.5); // scales with zoom, like the window
         int bx = sx - bw, by = sy - bw, bsw = sw + 2*bw, bsh = sh + 2*bw;
         if (bx >= z->sw || by >= z->sh || bx+bsw <= 0 || by+bsh <= 0) continue;
         if (bw > 0) {
@@ -295,9 +280,7 @@ static void on_map(ZWM *z, XMapRequestEvent *ev) {
     Client *c = find(z, ev->window);
     if (!c && (c = manage(z, ev->window))) {
         if (c->anchor) {
-            /* Fixed landmark at the canvas origin -- not wherever the
-             * viewport happens to be when it's launched. */
-            c->cx = -c->cw / 2.0;
+            c->cx = -c->cw / 2.0; // fixed at the canvas origin, not wherever the viewport is
             c->cy = -c->ch / 2.0;
         } else {
             c->cx = z->vp.cx - c->cw / 2.0;
@@ -319,8 +302,7 @@ static void on_destroy(ZWM *z, XDestroyWindowEvent *ev) {
     unmanage(z, ev->window); unmanage_override(z, ev->window); redraw(z);
 }
 
-/* Override-redirect windows map themselves directly (no MapRequest), so
- * they're only visible to us via MapNotify. */
+// override-redirect windows map themselves directly, so we only see them via MapNotify
 static void on_mapnotify(ZWM *z, XMapEvent *ev) {
     if (ev->window == z->overlay) return;
     XWindowAttributes a;
@@ -331,10 +313,12 @@ static void on_mapnotify(ZWM *z, XMapEvent *ev) {
 static void on_configure(ZWM *z, XConfigureRequestEvent *ev) {
     Client *c = find(z, ev->window);
     if (c) {
+        // size only; canvas position (c->cx/cy) is ours to manage, not the client's to request
         if (ev->value_mask & CWWidth)  c->cw = ev->width;
         if (ev->value_mask & CWHeight) c->ch = ev->height;
         park(z, c);
     } else {
+        // not yet managed (e.g. still override-redirect): honor the request as-is
         XWindowChanges wc = { .x = ev->x, .y = ev->y,
             .width = ev->width, .height = ev->height,
             .border_width = ev->border_width, .sibling = ev->above, .stack_mode = ev->detail };
@@ -342,12 +326,9 @@ static void on_configure(ZWM *z, XConfigureRequestEvent *ev) {
     }
 }
 
-/* Raises c to the top of the stack, gives it input focus, and redraws.
- * Returns the client's new (post-raise) pointer, since raise_client()
- * shuffles the array and invalidates the one passed in. */
 static Client *focus_raise(ZWM *z, Client *c) {
     raise_client(z, c);
-    c = &z->clients[z->nclients - 1];
+    c = &z->clients[z->nclients - 1]; // raise_client() shuffled the array; re-fetch c
     z->focused = c->window;
     XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
     redraw(z);
@@ -365,9 +346,7 @@ static void on_button(ZWM *z, XButtonEvent *ev) {
         return;
     }
     if (ev->button != 1 && ev->button != 3) return;
-    /* Super+drag: grabbed globally on the root (see main()), so this is a
-     * WM gesture regardless of which real window the pointer is over. */
-    if (ev->state & Mod4Mask) {
+    if (ev->state & Mod4Mask) { // Super+drag, grabbed globally on the root: a WM gesture, not a client click
         Client *c = hit(z, ev->x_root, ev->y_root);
         if (!c) return;
         c = focus_raise(z, c);
@@ -387,10 +366,8 @@ static void on_button(ZWM *z, XButtonEvent *ev) {
         return;
     }
 
-    /* Plain click: the per-client grab from manage() firing on the real
-     * client. Do focus+raise, then replay -- the X server re-hit-tests,
-     * finds the same window, and delivers the press for real; its implicit
-     * grab carries the rest of the drag straight to the client. */
+    // plain click: per-client grab from manage() fired. focus+raise, then replay so X
+    // re-hit-tests and delivers the press (and the rest of the drag) to the client for real.
     Client *c = find(z, ev->window);
     if (c) focus_raise(z, c);
     XAllowEvents(z->dpy, ReplayPointer, ev->time);
@@ -405,13 +382,7 @@ static void on_release(ZWM *z, XButtonEvent *ev) {
     }
 }
 
-/* Edge snapping (see SNAP_* in config.h). Per axis, each other window
- * contributes up to two candidate deltas -- flush, or SNAP_GAP apart -- and
- * the smallest one under SNAP_DIST wins. Axis candidates normally require
- * overlap on the *other* axis (so windows don't snap on a coincidental
- * shared coordinate); the one exception is a window that already won the
- * other axis's snap, which is tried here unconditionally so corners can
- * snap to corners. */
+// edge snapping, see SNAP_* in config.h
 static void snap_translate(ZWM *z, Client *c, double basex, double basey, double *dx, double *dy) {
     if (!SNAP_ENABLED) return;
     double l = basex + *dx, r = l + c->cw, t = basey + *dy, b = t + c->ch;
@@ -421,6 +392,8 @@ static void snap_translate(ZWM *z, Client *c, double basex, double basey, double
         Client *o = &z->clients[i];
         if (o == c) continue;
         double ol = o->cx, orr = o->cx + o->cw, ot = o->cy, ob = o->cy + o->ch;
+        // each window offers up to 4 candidates (flush or SNAP_GAP apart, each edge); smallest under
+        // SNAP_DIST wins. Require overlap on the other axis so windows don't snap on a coincidence.
         if (t < ob && b > ot) {
             double xc[4] = { ol - l, (orr + SNAP_GAP) - l, orr - r, (ol - SNAP_GAP) - r };
             for (int k = 0; k < 4; k++) if (fabs(xc[k]) < fabs(bestx)) { bestx = xc[k]; ox = o; }
@@ -430,6 +403,8 @@ static void snap_translate(ZWM *z, Client *c, double basex, double basey, double
             for (int k = 0; k < 4; k++) if (fabs(yc[k]) < fabs(besty)) { besty = yc[k]; oy = o; }
         }
     }
+    // a window that already won one axis is retried on the other axis without the overlap
+    // requirement, so corners can snap to corners
     if (ox && !oy) {
         double ot = ox->cy, ob = ox->cy + ox->ch;
         double yc[4] = { ot - t, (ob + SNAP_GAP) - t, ob - b, (ot - SNAP_GAP) - b };
@@ -443,6 +418,7 @@ static void snap_translate(ZWM *z, Client *c, double basex, double basey, double
     if (oy) *dy += besty;
 }
 
+// same idea as snap_translate(), but only the bottom-right edge moves
 static void snap_resize(ZWM *z, Client *c, double *dw, double *dh) {
     if (!SNAP_ENABLED) return;
     double l = c->cx, r = l + c->cw + *dw, t = c->cy, b = t + c->ch + *dh;
@@ -507,15 +483,10 @@ static void on_motion(ZWM *z, XMotionEvent *ev) {
     }
 }
 
-/* Driven by XI_RawMotion (global on the root), which fires on every real
- * pointer move regardless of which window owns a grab -- so this runs
- * continuously without disturbing whatever implicit grab is carrying a
- * drag's events to a client (see on_button()).
- *
- * Parks the client visually under the cursor at the matching real screen
- * position and raises it, so plain X routing delivers input to the right
- * native pixel. Re-deriving the window-local point from the live inverse
- * transform each time keeps this zoom-correct. */
+// driven by XI_RawMotion (global on the root), which fires on every pointer move regardless of
+// which window owns a grab, so it never disturbs a drag's implicit grab (see on_button()).
+// Parks whichever client is under the cursor at the matching real screen position and raises it,
+// so plain X routing delivers input to the right native pixel.
 static void on_hover(ZWM *z) {
     Window root_ret, child_ret;
     int root_x, root_y, win_x, win_y;
@@ -592,10 +563,8 @@ int main(void) {
         XGrabKey(z.dpy, b->keycode, b->mod, z.root, True, GrabModeAsync, GrabModeAsync);
     }
 
-    /* Super+move/resize, pan, and zoom are WM gestures, grabbed globally on
-     * the root rather than the overlay. Plain clicks stay ungrabbed here --
-     * they're caught by the per-client passive grab in manage() instead, so
-     * they can be replayed through to the client (see on_button()). */
+    // Super+move/resize, pan, and zoom are WM gestures, grabbed globally on the root. Plain
+    // clicks stay ungrabbed here -- manage()'s per-client grab catches those for replay instead.
     XGrabButton(z.dpy, Button1, Mod4Mask, z.root, True, ButtonPressMask,
                 GrabModeAsync, GrabModeAsync, None, None);
     XGrabButton(z.dpy, Button3, Mod4Mask, z.root, True, ButtonPressMask,
@@ -614,17 +583,11 @@ int main(void) {
     z.overlay = XCompositeGetOverlayWindow(z.dpy, z.root);
     XSelectInput(z.dpy, z.overlay, ButtonPressMask|ButtonReleaseMask|PointerMotionMask|KeyPressMask);
     Cursor cur = XCreateFontCursor(z.dpy, XC_left_ptr);
-    /* Set on the root, not the overlay: the overlay's input shape is empty
-     * (below), so cursor lookup falls through to whatever real window the
-     * pointer is over -- the root when no client is parked there, or a
-     * client with no cursor of its own, which inherits from its parent
-     * (root, since zzwm is non-reparenting). One root-level default covers
-     * both cases. */
+    // set on the root, not the overlay: the overlay's input shape is empty (below), so cursor
+    // lookup falls through to the root or to a client (which inherits from root, non-reparenting)
     XDefineCursor(z.dpy, z.root, cur); XFreeCursor(z.dpy, cur);
-    /* Empty input shape makes the overlay fully click-through, like
-     * InfiniteGlass's overlay_set_input(False): plain clicks pass straight
-     * to whichever client on_hover() has parked under the cursor. WM
-     * gestures don't need this -- they're grabbed on the root. */
+    // empty input shape makes the overlay click-through, so clicks reach whatever client
+    // on_hover() has parked under the cursor; WM gestures don't need this, they're grabbed on the root
     XserverRegion empty = XFixesCreateRegion(z.dpy, NULL, 0);
     XFixesSetWindowShapeRegion(z.dpy, z.overlay, ShapeInput, 0, 0, empty);
     XFixesDestroyRegion(z.dpy, empty);

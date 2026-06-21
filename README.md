@@ -1,6 +1,6 @@
 # ZZWM (Zoe's Zooming Window Manager)
 
-A minimal (>1000 lines for the base wm) X11 window manager where all windows live on an infinite
+A minimal (<750 lines for the base wm) X11 window manager where all windows live on an infinite
 2D canvas. Navigation is spatial, you can scroll to zoom and drag to pan.
 
 Four binaries: `zzwm` (the main window manager) plus three small utility apps in
@@ -14,7 +14,7 @@ Four binaries: `zzwm` (the main window manager) plus three small utility apps in
   zoom/pan. Shows a clock and a permanent "Super+H for help" hint.
 - `zzwm-help` — a keybinding reference (Super+H). Reads `config.h`'s
   bindings table directly, so it always matches the real configuration; any
-  keypress closes it (not clicks -- see Known limitations).
+  keypress closes it, not a click.
 
 ## Controls
 (mostly reconfigurable)
@@ -46,7 +46,7 @@ Edit `config.h` and rebuild to change functionality:
 - `SNAP_DIST` — how close (in canvas/native pixels, independent of zoom) an
   edge has to get to another window's edge before it snaps. Default `12`.
 - `SNAP_GAP` — space (same units) left between two windows when they snap
-  side-by-side instead of sitting flush. Default `0`.
+  side-by-side instead of sitting flush. Default `10`.
 
 No changes to `zzwm.c` are needed for either.
 
@@ -119,69 +119,3 @@ could leave you without a way to spawn a terminal.)
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-## Architecture
-
-**Non-reparenting WM** — managed windows remain direct children of the root;
-no frame windows are inserted.
-
-**XComposite redirect** — every managed window is redirected to an off-screen
-pixmap (`RedirectAutomatic`). Windows are parked out of sight at their natural
-pixel dimensions, so terminal content never reflows regardless of zoom level.
-
-**XRender compositing** — on each viewport change the WM composites each
-window's pixmap onto the Composite overlay window at the current scale:
-bilinear filtering when shrinking (smooth), nearest-neighbor when
-magnifying (crisp, avoids blur).
-
-**XDamage** — the WM subscribes to `XDamageNotify` on each managed window
-(including override-redirect popups like menus) and redraws the overlay
-whenever window content changes.
-
-**zzwm-run, zzwm-bar, and zzwm-help are separate processes**, not built into
-`zzwm`. All are plain client windows with no special X properties; zzwm
-treats `zzwm-run` and `zzwm-help` like any other window (centred on the
-viewport, canvas-scaled). `zzwm-bar` names itself `ANCHOR_NAME`
-(`"zzwm-bar"` by default, configurable in `config.h`) via `XStoreName`;
-zzwm recognizes that name, anchors the window at the canvas origin instead
-of the viewport, and ignores `Super+Q` and `Super+left-drag` on it (the
-`anchor` flag on `Client` in `zzwm.c`).
-
-`zzwm-help` includes `config.h` directly with the same `BIND`-macro trick
-`zzwm.c` uses, so its listing always reflects the real configuration rather
-than a separately maintained copy.
-
-**Click passthrough** (the same technique [InfiniteGlass](https://github.com/redhog/InfiniteGlass)
-uses): clicks are never synthesized. The Composite overlay's input shape is
-set to empty (`XFixesSetWindowShapeRegion`), so it's fully click-through;
-`XI_RawMotion`, selected globally on the root, drives `on_hover()`, which
-continuously parks whichever client is visually under the real cursor at the
-matching real screen position (inverting the canvas transform on every
-event, so drags stay pixel-correct at any zoom level) and raises it. A
-plain click is then a genuine `ButtonPress` landing on that real window via
-ordinary X routing — caught by a synchronous passive grab in `manage()`
-just long enough to do focus+raise bookkeeping, then replayed
-(`XAllowEvents(ReplayPointer)`) so the X server delivers it for real. Its
-own implicit grab then carries the rest of the gesture (drag motion,
-release) straight to the client with no further WM involvement, which is
-also why it works for XInput2-only clients, not just core-protocol ones.
-Super-modified gestures (move/resize) and pan/zoom are grabbed globally on
-the root instead, so they never compete with this.
-
-```
-scroll / pan → Viewport(cx, cy, zoom) → redraw()
-                                              │
-                         ┌────────────────────┘
-                         ▼
-               for each Client:
-                 XCompositeNameWindowPixmap()    ← off-screen pixmap
-                 XRenderSetPictureTransform()    ← scale matrix 1/zoom
-                 XRenderComposite() → overlay    ← scaled blit
-```
-
-## Known limitations
-
-- `zzwm-help` only closes on a keypress, not a click.
-- Single monitor only.
-- Windows with non-standard visuals (depth ≠ 24/32) are skipped.
-- Max 64 managed windows (`MAX_CLIENTS`).
