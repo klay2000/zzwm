@@ -30,10 +30,8 @@ BIND(Mod4Mask, XK_q,      ACT_CLOSE, NULL)
 #define SNAP_DIST    12
 #define SNAP_GAP     10
 
-/* zzwm-bar (utility-apps/statusbar.c). BAR_CMD is a shell command whose
- * first line of output is shown below the clock, re-run every
- * BAR_CMD_INTERVAL seconds; leave it "" to disable that line entirely. */
-#define BAR_TIME_FORMAT "%Y-%m-%d  %H:%M:%S"
-#define BAR_HINT        "Super+H for help"
-#define BAR_CMD          ""
-#define BAR_CMD_INTERVAL 5
+/* zzwm-bar (utility-apps/statusbar.c). BAR_CMD is a shell command; each
+ * line of its output becomes one centred line in the bar, re-run every
+ * BAR_CMD_INTERVAL seconds. */
+#define BAR_CMD          "date '+%Y-%m-%d  %H:%M:%S'; echo 'Super+H for help'"
+#define BAR_CMD_INTERVAL 1

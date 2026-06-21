@@ -3,8 +3,9 @@
  *
  * Named "zzwm-bar" (ANCHOR_NAME in config.h) -- zzwm anchors it at the
  * canvas origin instead of the viewport, and won't close or move it.
- * Shows date/time, a help hint, and optionally a line of BAR_CMD output
- * (see config.h), centred. Intentionally minimal.
+ * Its entire contents come from running BAR_CMD (see config.h): each
+ * line of output becomes one centred line in the bar, re-run every
+ * BAR_CMD_INTERVAL seconds. Intentionally minimal.
  *
  * Build:  cc -O2 -o zzwm-bar statusbar.c -lX11
  */
@@ -23,13 +24,19 @@
 #undef BIND
 
 #define BAR_W 280
+#define BAR_MAX_LINES 8
+#define BAR_LINE_LEN 64
 
-static void run_bar_cmd(char *out, size_t outsz) {
+static int run_bar_cmd(char lines[][BAR_LINE_LEN], int max_lines) {
     FILE *p = popen(BAR_CMD, "r");
-    if (!p) { out[0] = 0; return; }
-    if (!fgets(out, (int)outsz, p)) out[0] = 0;
+    if (!p) return 0;
+    int n = 0;
+    while (n < max_lines && fgets(lines[n], BAR_LINE_LEN, p)) {
+        lines[n][strcspn(lines[n], "\n")] = 0;
+        n++;
+    }
     pclose(p);
-    out[strcspn(out, "\n")] = 0;
+    return n;
 }
 
 int main(void) {
@@ -41,12 +48,11 @@ int main(void) {
 
     unsigned long col_bg  = alloc_color(dpy, cmap, BG_R, BG_G, BG_B);
     unsigned long col_fg  = alloc_color(dpy, cmap, FG_R, FG_G, FG_B);
-    unsigned long col_dim = alloc_color(dpy, cmap, DIM_R, DIM_G, DIM_B);
 
     XFontStruct *font = XLoadQueryFont(dpy, FONT_NAME);
     int th = font ? font->ascent + font->descent : 14;
     int lh = th + 6;
-    int nlines = BAR_CMD[0] ? 3 : 2;
+    int nlines = 1;
     int bar_h = lh * nlines + 16;
 
     XSetWindowAttributes wa = { .background_pixel = col_bg, .event_mask = ExposureMask };
@@ -60,42 +66,34 @@ int main(void) {
 
     XMapWindow(dpy, win);
 
-    char cmd_out[64] = "";
+    char cmd_out[BAR_MAX_LINES][BAR_LINE_LEN] = {{0}};
+    int cmd_n = 0;
     time_t cmd_last = 0;
     int xfd = XConnectionNumber(dpy);
     for (;;) {
         time_t now = time(NULL);
-        if (BAR_CMD[0] && now - cmd_last >= BAR_CMD_INTERVAL) {
-            run_bar_cmd(cmd_out, sizeof cmd_out);
+        if (now - cmd_last >= BAR_CMD_INTERVAL) {
+            cmd_n = run_bar_cmd(cmd_out, BAR_MAX_LINES);
             cmd_last = now;
         }
 
-        char text[64];
-        struct tm tmv;
-        localtime_r(&now, &tmv);
-        strftime(text, sizeof text, BAR_TIME_FORMAT, &tmv);
+        nlines = cmd_n > 0 ? cmd_n : 1;
+        int new_h = lh * nlines + 16;
+        if (new_h != bar_h) {
+            bar_h = new_h;
+            XResizeWindow(dpy, win, BAR_W, bar_h);
+        }
 
         XSetForeground(dpy, gc, col_bg);
         XFillRectangle(dpy, win, gc, 0, 0, BAR_W, bar_h);
 
         int y = (bar_h - nlines * lh) / 2 + th;
-        int len = (int)strlen(text);
-        int tw = font ? XTextWidth(font, text, len) : 6 * len;
         XSetForeground(dpy, gc, col_fg);
-        XDrawString(dpy, win, gc, (BAR_W - tw) / 2, y, text, len);
-        y += lh;
-
-        int hlen = (int)strlen(BAR_HINT);
-        int hw = font ? XTextWidth(font, BAR_HINT, hlen) : 6 * hlen;
-        XSetForeground(dpy, gc, col_dim);
-        XDrawString(dpy, win, gc, (BAR_W - hw) / 2, y, BAR_HINT, hlen);
-        y += lh;
-
-        if (BAR_CMD[0]) {
-            int clen = (int)strlen(cmd_out);
-            int cw = font ? XTextWidth(font, cmd_out, clen) : 6 * clen;
-            XSetForeground(dpy, gc, col_fg);
-            XDrawString(dpy, win, gc, (BAR_W - cw) / 2, y, cmd_out, clen);
+        for (int i = 0; i < cmd_n; i++) {
+            int len = (int)strlen(cmd_out[i]);
+            int w = font ? XTextWidth(font, cmd_out[i], len) : 6 * len;
+            XDrawString(dpy, win, gc, (BAR_W - w) / 2, y, cmd_out[i], len);
+            y += lh;
         }
         XFlush(dpy);
 
