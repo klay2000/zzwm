@@ -370,6 +370,8 @@ static Client *focus_raise(ZWM *z, Client *c) {
     raise_client(z, c);
     c = &z->clients[z->nclients - 1]; // raise_client() shuffled the array; re-fetch c
     z->focused = c->window;
+    XRaiseWindow(z->dpy, c->window); // real stacking only needs to move on click, not on every hover tick --
+                                      // otherwise it keeps clobbering the stacking of open menus/popups
     XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
     request_redraw(z);
     return c;
@@ -525,8 +527,8 @@ static void on_motion(ZWM *z, XMotionEvent *ev) {
 
 // driven by XI_RawMotion (global on the root), which fires on every pointer move regardless of
 // which window owns a grab, so it never disturbs a drag's implicit grab (see on_button()).
-// Parks whichever client is under the cursor at the matching real screen position and raises it,
-// so plain X routing delivers input to the right native pixel.
+// Parks whichever client is under the cursor at the matching real screen position so plain
+// X routing delivers input to the right native pixel (real stacking is untouched here).
 static void on_hover(ZWM *z) {
     Window root_ret, child_ret;
     int root_x, root_y, win_x, win_y;
@@ -536,13 +538,17 @@ static void on_hover(ZWM *z) {
         return;
 
     XWindowAttributes a;
-    Client *c = hit_override(z, root_x, root_y, &a) ? NULL : hit(z, root_x, root_y);
+    Window ov = hit_override(z, root_x, root_y, &a);
+    Client *c = ov ? NULL : hit(z, root_x, root_y);
     if (c && z->hover_win && c->window != z->hover_win) {
         Client *prev = find(z, z->hover_win);
         if (prev) park(z, prev);
     }
     if (!c) {
-        if (z->hover_win) {
+        // hovering an open menu/dropdown: leave its parent's real window exactly where it
+        // is -- popups that track their anchor's screen position (e.g. GTK) will visibly
+        // jump if we park it, since parking moves the real window away
+        if (!ov && z->hover_win) {
             Client *prev = find(z, z->hover_win);
             if (prev) park(z, prev);
             z->hover_win = 0;
@@ -552,8 +558,9 @@ static void on_hover(ZWM *z) {
 
     int wx, wy;
     to_client_local(c, &z->vp, root_x, root_y, &wx, &wy);
+    // reposition only -- real stacking is left alone here so hovering never bumps an
+    // open menu/dropdown's popup out from under itself (see focus_raise() for the raise)
     XMoveWindow(z->dpy, c->window, root_x - wx, root_y - wy);
-    XRaiseWindow(z->dpy, c->window);
     z->hover_win = c->window;
 }
 
