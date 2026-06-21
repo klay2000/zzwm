@@ -34,8 +34,8 @@ static Binding bindings[] = {
 #define NBINDINGS (int)(sizeof(bindings) / sizeof(bindings[0]))
 
 static const char *BASIC[] = {
-    "Scroll wheel        Zoom in / out, centred on cursor",
-    "Middle-click drag   Pan the canvas",
+    "Super+scroll wheel   Zoom in / out, centred on cursor",
+    "Super+middle-drag    Pan the canvas",
     "Left-click window    Focus (and raise to top)",
     "Super+left-drag      Move window on canvas",
     "Super+right-drag     Resize window",
