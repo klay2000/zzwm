@@ -13,7 +13,7 @@
  *
  * See config.h for keybindings and the SNAP_* edge-snapping settings.
  *
- * Build:  cc -O2 -o zzwm zzwm.c -lX11 -lXrender -lXcomposite -lXdamage -lXfixes -lXi -lm
+ * Build:  cc -O2 -o zzwm zzwm.c -lX11 -lXrender -lXcomposite -lXdamage -lXfixes -lXi -lXpresent -lm
  * Test:   Xephyr :1 -screen 1280x800 && DISPLAY=:1 ./zzwm
  */
 
@@ -30,6 +30,7 @@
 #include <X11/extensions/shape.h>
 #include <X11/extensions/Xfixes.h>
 #include <X11/extensions/XInput2.h>
+#include <X11/extensions/Xpresent.h>
 #include <X11/extensions/Xrender.h>
 
 #include "appearance.h"
@@ -67,7 +68,12 @@ typedef struct {
 typedef struct {
     Display  *dpy;
     Window    root, overlay;
-    Picture   overlay_pic;
+    Pixmap    backbuf[2];
+    Picture   backbuf_pic[2];
+    int       buf_busy[2];   /* server may still be presenting/reading this buffer */
+    int       cur_buf;       /* buffer to draw into next */
+    int       dirty;         /* a redraw is pending */
+    uint32_t  present_serial;
     int       sw, sh;
     Viewport  vp;
     XRenderPictFormat *fmt32, *fmt24;
@@ -78,6 +84,7 @@ typedef struct {
     Window    focused;
     int       damage_event;
     int       xi_opcode;
+    int       present_opcode;
     Window    hover_win;   /* client currently parked under the real cursor */
     int    panning, pan_sx, pan_sy;
     double pan_vx, pan_vy;
@@ -226,7 +233,7 @@ static void unmanage(ZWM *z, Window w) {
 // shared tail of both redraw() loops; zoom <= 0 skips the transform (override-redirect popups
 // always draw at native scale)
 static void composite_window(ZWM *z, Window w, int depth, double zoom, int op,
-                              int sx, int sy, int sw, int sh) {
+                              Picture dst, int sx, int sy, int sw, int sh) {
     Pixmap pix = XCompositeNameWindowPixmap(z->dpy, w);
     if (!pix) return;
     Picture src = XRenderCreatePicture(z->dpy, pix,
@@ -238,15 +245,17 @@ static void composite_window(ZWM *z, Window w, int depth, double zoom, int op,
         XRenderSetPictureFilter(z->dpy, src, filt, NULL, 0);
         XRenderSetPictureTransform(z->dpy, src, &xf);
     }
-    XRenderComposite(z->dpy, op, src, None, z->overlay_pic, 0, 0, 0, 0, sx, sy, sw, sh);
+    XRenderComposite(z->dpy, op, src, None, dst, 0, 0, 0, 0, sx, sy, sw, sh);
     XRenderFreePicture(z->dpy, src);
     XFreePixmap(z->dpy, pix);
 }
 
-static void redraw(ZWM *z) {
+// builds one full frame into the backbuffer that isn't currently owned by the X server
+static void composite_frame(ZWM *z) {
+    Picture dst = z->backbuf_pic[z->cur_buf];
     XRenderColor bg = { CANVAS_BG_R * 257, CANVAS_BG_G * 257, CANVAS_BG_B * 257, 0xffff };
     XRectangle rect = { 0, 0, (unsigned short)z->sw, (unsigned short)z->sh };
-    XRenderFillRectangles(z->dpy, PictOpSrc, z->overlay_pic, &bg, &rect, 1);
+    XRenderFillRectangles(z->dpy, PictOpSrc, dst, &bg, &rect, 1);
     XRenderColor border_col = { BORDER_R * 257, BORDER_G * 257, BORDER_B * 257, 0xffff };
 
     for (int i = 0; i < z->nclients; i++) {
@@ -259,18 +268,49 @@ static void redraw(ZWM *z) {
         if (bw > 0) {
             XRectangle brect = { (short)bx, (short)by,
                                   (unsigned short)bsw, (unsigned short)bsh };
-            XRenderFillRectangles(z->dpy, PictOpSrc, z->overlay_pic, &border_col, &brect, 1);
+            XRenderFillRectangles(z->dpy, PictOpSrc, dst, &border_col, &brect, 1);
         }
-        composite_window(z, c->window, c->depth, z->vp.zoom, PictOpSrc, sx, sy, sw, sh);
+        composite_window(z, c->window, c->depth, z->vp.zoom, PictOpSrc, dst, sx, sy, sw, sh);
     }
     for (int i = 0; i < z->noverride; i++) {
         Window w = z->overrides[i];
         XWindowAttributes a;
         if (!XGetWindowAttributes(z->dpy, w, &a) || a.map_state != IsViewable) continue;
         if (a.x >= z->sw || a.y >= z->sh || a.x+a.width <= 0 || a.y+a.height <= 0) continue;
-        composite_window(z, w, a.depth, 0, PictOpOver, a.x, a.y, a.width, a.height);
+        composite_window(z, w, a.depth, 0, PictOpOver, dst, a.x, a.y, a.width, a.height);
     }
+}
+
+// hands the just-built backbuffer to the Present extension, which copies it onto the overlay
+// window synced to the next vblank (no PresentOptionAsync) -- this is what kills the tearing
+static void present(ZWM *z) {
+    int i = z->cur_buf;
+    XPresentPixmap(z->dpy, z->overlay, z->backbuf[i], ++z->present_serial,
+                   None, None, 0, 0, None, None, None,
+                   PresentOptionNone, 0, 0, 0, NULL, 0);
     XFlush(z->dpy);
+    z->buf_busy[i] = 1;
+    z->cur_buf = 1 - i;
+    z->dirty = 0;
+}
+
+// draws+presents only if the next buffer is free; otherwise leaves dirty set so
+// on_present_idle() retries once the server signals that buffer is no longer in use
+static void pump_redraw(ZWM *z) {
+    if (!z->dirty || z->buf_busy[z->cur_buf]) return;
+    composite_frame(z);
+    present(z);
+}
+
+static void request_redraw(ZWM *z) {
+    z->dirty = 1;
+    pump_redraw(z);
+}
+
+static void on_present_idle(ZWM *z, XPresentIdleNotifyEvent *e) {
+    for (int i = 0; i < 2; i++)
+        if (z->backbuf[i] == e->pixmap) z->buf_busy[i] = 0;
+    pump_redraw(z);
 }
 
 static void on_map(ZWM *z, XMapRequestEvent *ev) {
@@ -289,17 +329,17 @@ static void on_map(ZWM *z, XMapRequestEvent *ev) {
     }
     XMapWindow(z->dpy, ev->window);
     if (c) { z->focused = c->window; XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime); }
-    redraw(z);
+    request_redraw(z);
 }
 
 static void on_unmap(ZWM *z, XUnmapEvent *ev) {
     if (!ev->send_event) {
-        unmanage(z, ev->window); unmanage_override(z, ev->window); redraw(z);
+        unmanage(z, ev->window); unmanage_override(z, ev->window); request_redraw(z);
     }
 }
 
 static void on_destroy(ZWM *z, XDestroyWindowEvent *ev) {
-    unmanage(z, ev->window); unmanage_override(z, ev->window); redraw(z);
+    unmanage(z, ev->window); unmanage_override(z, ev->window); request_redraw(z);
 }
 
 // override-redirect windows map themselves directly, so we only see them via MapNotify
@@ -307,7 +347,7 @@ static void on_mapnotify(ZWM *z, XMapEvent *ev) {
     if (ev->window == z->overlay) return;
     XWindowAttributes a;
     if (!XGetWindowAttributes(z->dpy, ev->window, &a)) return;
-    if (a.override_redirect) { manage_override(z, ev->window); redraw(z); }
+    if (a.override_redirect) { manage_override(z, ev->window); request_redraw(z); }
 }
 
 static void on_configure(ZWM *z, XConfigureRequestEvent *ev) {
@@ -331,13 +371,13 @@ static Client *focus_raise(ZWM *z, Client *c) {
     c = &z->clients[z->nclients - 1]; // raise_client() shuffled the array; re-fetch c
     z->focused = c->window;
     XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
-    redraw(z);
+    request_redraw(z);
     return c;
 }
 
 static void on_button(ZWM *z, XButtonEvent *ev) {
-    if (ev->button == 4) { zoom_at(&z->vp, ev->x_root, ev->y_root, ZOOM_SPEED);     redraw(z); return; }
-    if (ev->button == 5) { zoom_at(&z->vp, ev->x_root, ev->y_root, 1.0/ZOOM_SPEED); redraw(z); return; }
+    if (ev->button == 4) { zoom_at(&z->vp, ev->x_root, ev->y_root, ZOOM_SPEED);     request_redraw(z); return; }
+    if (ev->button == 5) { zoom_at(&z->vp, ev->x_root, ev->y_root, 1.0/ZOOM_SPEED); request_redraw(z); return; }
     if (ev->button == 2) {
         z->panning = 1; z->pan_sx = ev->x_root; z->pan_sy = ev->y_root;
         z->pan_vx = z->vp.cx; z->pan_vy = z->vp.cy;
@@ -461,7 +501,7 @@ static void on_motion(ZWM *z, XMotionEvent *ev) {
             snap_translate(z, c, z->move_cx, z->move_cy, &dx, &dy);
             c->cx = z->move_cx + dx;
             c->cy = z->move_cy + dy;
-            redraw(z);
+            request_redraw(z);
         }
     } else if (z->resizing) {
         Client *c = find(z, z->resize_win);
@@ -474,12 +514,12 @@ static void on_motion(ZWM *z, XMotionEvent *ev) {
             c->cw = nw < 20 ? 20 : nw;
             c->ch = nh < 20 ? 20 : nh;
             park(z, c);
-            redraw(z);
+            request_redraw(z);
         }
     } else if (z->panning) {
         z->vp.cx = z->pan_vx - (ev->x_root - z->pan_sx) / z->vp.zoom;
         z->vp.cy = z->pan_vy - (ev->y_root - z->pan_sy) / z->vp.zoom;
-        redraw(z);
+        request_redraw(z);
     }
 }
 
@@ -556,6 +596,9 @@ int main(void) {
         fputs("zzwm: no XInput2\n", stderr); return 1;
     }
     { int maj = 2, min = 2; XIQueryVersion(z.dpy, &maj, &min); }
+    if (!XPresentQueryExtension(z.dpy, &z.present_opcode, &eb, &ee)) {
+        fputs("zzwm: no XPresent\n", stderr); return 1;
+    }
 
     for (int i = 0; i < NBINDINGS; i++) {
         Binding *b = &bindings[i];
@@ -596,8 +639,12 @@ int main(void) {
     z.fmt24 = XRenderFindStandardFormat(z.dpy, PictStandardRGB24);
     XWindowAttributes oa;
     XGetWindowAttributes(z.dpy, z.overlay, &oa);
-    z.overlay_pic = XRenderCreatePicture(z.dpy, z.overlay,
-                                         XRenderFindVisualFormat(z.dpy, oa.visual), 0, NULL);
+    XRenderPictFormat *ofmt = XRenderFindVisualFormat(z.dpy, oa.visual);
+    for (int i = 0; i < 2; i++) {
+        z.backbuf[i] = XCreatePixmap(z.dpy, z.root, z.sw, z.sh, oa.depth);
+        z.backbuf_pic[i] = XRenderCreatePicture(z.dpy, z.backbuf[i], ofmt, 0, NULL);
+    }
+    XPresentSelectInput(z.dpy, z.overlay, PresentIdleNotifyMask);
 
     Window dummy, *ch; unsigned int n;
     XQueryTree(z.dpy, z.root, &dummy, &dummy, &ch, &n);
@@ -610,14 +657,14 @@ int main(void) {
         }
     }
     if (ch) XFree(ch);
-    redraw(&z);
+    request_redraw(&z);
 
     XEvent ev;
     for (;;) {
         XNextEvent(z.dpy, &ev);
         if (ev.type == z.damage_event + XDamageNotify) {
             XDamageSubtract(z.dpy, ((XDamageNotifyEvent *)&ev)->damage, None, None);
-            redraw(&z);
+            request_redraw(&z);
             continue;
         }
         switch (ev.type) {
@@ -629,10 +676,14 @@ int main(void) {
         case ButtonPress:      on_button(&z, &ev.xbutton);              break;
         case ButtonRelease:    on_release(&z, &ev.xbutton);             break;
         case MotionNotify:     on_motion(&z, &ev.xmotion);              break;
-        case KeyPress:         on_key(&z, &ev.xkey); redraw(&z);        break;
+        case KeyPress:         on_key(&z, &ev.xkey); request_redraw(&z);        break;
         case GenericEvent:
             if (ev.xcookie.extension == z.xi_opcode && XGetEventData(z.dpy, &ev.xcookie)) {
                 if (ev.xcookie.evtype == XI_RawMotion) on_hover(&z);
+                XFreeEventData(z.dpy, &ev.xcookie);
+            } else if (ev.xcookie.extension == z.present_opcode && XGetEventData(z.dpy, &ev.xcookie)) {
+                if (ev.xcookie.evtype == PresentIdleNotify)
+                    on_present_idle(&z, (XPresentIdleNotifyEvent *)ev.xcookie.data);
                 XFreeEventData(z.dpy, &ev.xcookie);
             }
             break;
