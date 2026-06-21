@@ -19,7 +19,7 @@
  *   Super+Q             close focused window
  *   Super+Alt+L         logout (multi-key bind example)
 */
-BIND(Mod4Mask, XK_Return, ACT_SPAWN, "st &")
+BIND(Mod4Mask, XK_Return, ACT_SPAWN, "xterm &")
 BIND(Mod4Mask, XK_space,  ACT_SPAWN, "zzwm-run &")
 BIND(Mod4Mask, XK_h,      ACT_SPAWN, "zzwm-help &")
 BIND(Mod4Mask, XK_q,      ACT_CLOSE, NULL)
