@@ -1,7 +1,8 @@
 # ZZWM (Zoe's Zooming Window Manager)
 
 A minimal (<750 lines for the base wm) X11 window manager where all windows live on an infinite
-2D canvas. Navigation is spatial, you can scroll to zoom and drag to pan.
+2D canvas. Navigation is spatial: Super+scroll to zoom, Super+middle-drag to pan. Plain scroll
+and middle-click (no Super) are passed straight through to the window under the cursor.
 
 Four binaries: `zzwm` (the main window manager) plus three small utility apps in
 `utility-apps/`:
@@ -21,8 +22,8 @@ Four binaries: `zzwm` (the main window manager) plus three small utility apps in
 (mostly reconfigurable)
 | Input | Action |
 |---|---|
-| Scroll wheel | Zoom in / out, centred on cursor |
-| Middle-click drag | Pan the canvas |
+| Super + Scroll wheel | Zoom in / out, centred on cursor |
+| Super + Middle-click drag | Pan the canvas |
 | Left-click window | Focus (and raise to top) |
 | Super + left-drag | Move window on canvas (no-op on the base window; snaps to other windows' edges, see Configuration) |
 | Super + right-drag | Resize window (also snaps) |

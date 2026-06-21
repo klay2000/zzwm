@@ -606,15 +606,13 @@ int main(void) {
         XGrabKey(z.dpy, b->keycode, b->mod, z.root, True, GrabModeAsync, GrabModeAsync);
     }
 
-    // Super+move/resize, pan, and zoom are WM gestures, grabbed globally on the root. Plain
-    // clicks stay ungrabbed here -- manage()'s per-client grab catches those for replay instead.
-    XGrabButton(z.dpy, Button1, Mod4Mask, z.root, True, ButtonPressMask,
-                GrabModeAsync, GrabModeAsync, None, None);
-    XGrabButton(z.dpy, Button3, Mod4Mask, z.root, True, ButtonPressMask,
-                GrabModeAsync, GrabModeAsync, None, None);
-    int wheel_btns[] = { 2, 4, 5 };
-    for (int i = 0; i < 3; i++)
-        XGrabButton(z.dpy, wheel_btns[i], AnyModifier, z.root, True, ButtonPressMask,
+    // Super+move/resize/pan/zoom are WM gestures, grabbed globally on the root, only with Super
+    // held. Plain clicks/scroll/middle-click stay ungrabbed -- they go straight to whatever
+    // client window is under the cursor (manage()'s per-client grab catches plain Button1/3
+    // for the focus-then-replay dance instead).
+    int wheel_btns[] = { Button1, Button3, Button2, Button4, Button5 };
+    for (int i = 0; i < 5; i++)
+        XGrabButton(z.dpy, wheel_btns[i], Mod4Mask, z.root, True, ButtonPressMask,
                     GrabModeAsync, GrabModeAsync, None, None);
 
     unsigned char ximask[(XI_LASTEVENT + 7) / 8] = {0};
