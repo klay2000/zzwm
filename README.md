@@ -2,6 +2,8 @@
 
 A small (<750 lines for the base wm), experimental X11 window manager where all windows live on an infinite 2D canvas. Navigation is spatial: Super+scroll to zoom, Super+middle-drag to pan.
 
+![ZZWM screenshot](screenshot.png)
+
 Four binaries: `zzwm` (the main window manager) plus three small utility apps in
 `utility-apps/`:
 
