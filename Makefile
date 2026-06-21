@@ -3,6 +3,7 @@ CFLAGS  = -O2 -Wall -Wextra -std=c99
 U       = utility-apps
 PREFIX  = /usr/local
 BINDIR  = $(DESTDIR)$(PREFIX)/bin
+XSESSIONSDIR = $(DESTDIR)/usr/share/xsessions
 
 .PHONY: all clean install uninstall
 
@@ -25,7 +26,10 @@ clean:
 
 install: all
 	install -d $(BINDIR)
-	install -m755 zzwm zzwm-run zzwm-bar zzwm-help $(BINDIR)
+	install -m755 zzwm zzwm-run zzwm-bar zzwm-help startZZWM.sh $(BINDIR)
+	install -d $(XSESSIONSDIR)
+	install -m644 zzwm.desktop $(XSESSIONSDIR)
 
 uninstall:
-	rm -f $(BINDIR)/zzwm $(BINDIR)/zzwm-run $(BINDIR)/zzwm-bar $(BINDIR)/zzwm-help
+	rm -f $(BINDIR)/zzwm $(BINDIR)/zzwm-run $(BINDIR)/zzwm-bar $(BINDIR)/zzwm-help $(BINDIR)/startZZWM.sh
+	rm -f $(XSESSIONSDIR)/zzwm.desktop

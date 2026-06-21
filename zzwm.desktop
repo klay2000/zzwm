@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=ZZWM Session
+Comment=Use this session to run ZZWM as your desktop environment
+Exec=startZZWM.sh
+Icon=
+Type=Application
+DesktopNames=ZZWM
+Keywords=ZZWM;session;desktop;environment;window manager;gui;

@@ -108,11 +108,18 @@ make install PREFIX=~/.local
 
 `zzwm` launches `zzwm-run`/`zzwm-bar`/`zzwm-help` via `system()` (e.g.
 `"zzwm-run &"`), so they must be on `$PATH` for keybindings like Super+Space
-to work — `make install` puts all four binaries in the same directory for
-that reason. `make uninstall` removes them again (respects the same
-`PREFIX`/`DESTDIR`).
+to work — `make install` puts all four binaries plus `startZZWM.sh` in the
+same directory for that reason. `make install` also installs `zzwm.desktop`
+to `/usr/share/xsessions` (independent of `PREFIX`, since that's the fixed
+location display managers scan), so ZZWM shows up as a session choice on
+your login screen. `make uninstall` removes all of it again (respects the
+same `PREFIX`/`DESTDIR`).
 
-To run zzwm as your actual X session window manager, add to `~/.xinitrc`:
+To start ZZWM via a display manager (GDM, LightDM, SDDM, etc.), just select
+the "ZZWM Session" entry at the login screen after `sudo make install`.
+
+To run zzwm as your actual X session window manager without a display
+manager, add to `~/.xinitrc`:
 
 ```sh
 zzwm-bar &
