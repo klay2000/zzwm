@@ -42,12 +42,16 @@ static const char *BASIC[] = {
 };
 #define NBASIC (int)(sizeof(BASIC) / sizeof(BASIC[0]))
 
-static const char *mod_name(unsigned int mod) {
-    if (mod & Mod4Mask)    return "Super";
-    if (mod & Mod1Mask)    return "Alt";
-    if (mod & ControlMask) return "Ctrl";
-    if (mod & ShiftMask)   return "Shift";
-    return "?";
+static const char *mod_name(unsigned int mod, char *buf, size_t bufsz) {
+    buf[0] = '\0';
+    if (mod & Mod4Mask)    strncat(buf, "Super+", bufsz - strlen(buf) - 1);
+    if (mod & Mod1Mask)    strncat(buf, "Alt+",   bufsz - strlen(buf) - 1);
+    if (mod & ControlMask) strncat(buf, "Ctrl+",  bufsz - strlen(buf) - 1);
+    if (mod & ShiftMask)   strncat(buf, "Shift+", bufsz - strlen(buf) - 1);
+    size_t n = strlen(buf);
+    if (n > 0) buf[n - 1] = '\0'; /* drop trailing '+' */
+    else strncpy(buf, "?", bufsz);
+    return buf;
 }
 
 int main(void) {
@@ -110,13 +114,15 @@ int main(void) {
         for (int i = 0; i < NBINDINGS; i++) {
             Binding *b = &bindings[i];
             const char *keyname = XKeysymToString(b->keysym);
+            char mods[32];
+            mod_name(b->mod, mods, sizeof mods);
             char line[256];
             if (b->action == ACT_SPAWN)
                 snprintf(line, sizeof line, "%s+%-10s spawn: %s",
-                         mod_name(b->mod), keyname ? keyname : "?", b->arg ? b->arg : "");
+                         mods, keyname ? keyname : "?", b->arg ? b->arg : "");
             else
                 snprintf(line, sizeof line, "%s+%-10s close focused window",
-                         mod_name(b->mod), keyname ? keyname : "?");
+                         mods, keyname ? keyname : "?");
             XDrawString(dpy, win, gc, 8, y, line, (int)strlen(line));
             y += lh;
         }
