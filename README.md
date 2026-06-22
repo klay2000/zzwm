@@ -77,11 +77,11 @@ No changes to any `.c` files are needed.
 make
 ```
 
-Requires: `libX11`, `libXrender`, `libXcomposite`, `libXdamage` (standard on any X desktop).
+Requires: `libX11`, `libXrender`, `libXcomposite`, `libXdamage`, '`libXoresent`, and `libXInput`.
 
 ```sh
 # Debian/Ubuntu:
-apt install libx11-dev libxrender-dev libxcomposite-dev libxdamage-dev xserver-xephyr
+apt install libx11-dev libxrender-dev libxcomposite-dev libxdamage-dev libxpresent-dev libxi-dev xserver-xephyr
 ```
 
 Always test inside a nested X server:
