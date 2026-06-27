@@ -77,7 +77,7 @@ No changes to any `.c` files are needed.
 make
 ```
 
-Requires: `libX11`, `libXrender`, `libXcomposite`, `libXdamage`, '`libXoresent`, and `libXInput`.
+Requires: `libX11`, `libXrender`, `libXcomposite`, `libXdamage`, `libXpresent`, and `libXInput`.
 
 ```sh
 # Debian/Ubuntu:
