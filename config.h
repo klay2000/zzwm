@@ -38,11 +38,11 @@ BIND(Mod4Mask|Mod1Mask, XK_l, ACT_SPAWN, "pkill -x zzwm &")
  * IDLE_LOCK_CMD is a shell command -- like the spawn bindings above, end it
  * with & so it backgrounds instead of blocking the WM (e.g. slock, i3lock,
  * xtrlock, or a custom script). */
-#define IDLE_LOCK_TIMEOUT 300
+#define IDLE_LOCK_TIMEOUT 1800
 #define IDLE_LOCK_CMD     "dm-tool lock"
 
 /* zzwm-bar (utility-apps/statusbar.c). BAR_CMD is a shell command; each
  * line of its output becomes one centred line in the bar, re-run every
  * BAR_CMD_INTERVAL seconds. */
-#define BAR_CMD          "date '+%Y-%m-%d  %H:%M:%S'; echo 'Super+H for help'"
+#define BAR_CMD          "date '+%Y-%m-%d  %H:%M:%S'"
 #define BAR_CMD_INTERVAL 1
