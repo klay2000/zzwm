@@ -3,17 +3,21 @@
  *
  * Main Controls
  * -------------
- *   scroll wheel        zoom in / out (centred on cursor)
- *   middle-click drag   pan the canvas
+ *   scroll wheel        zoom in / out (centred on cursor), per-monitor
+ *   middle-click drag   pan the canvas on the monitor under the cursor
  *   left/right-click    focus + raise, then forwarded to the window (click
  *                        buttons, links, etc. -- see Architecture)
  *   Super+left-drag     move window on canvas (snaps to other windows'
  *                       edges, see SNAP_* in config.h)
  *   Super+right-drag    resize window (also snaps)
  *
+ * Each monitor has its own independent zoom/pan viewport into the shared
+ * infinite canvas.  Use RandR at startup to detect monitor geometry; falls
+ * back to a single monitor covering the full virtual screen.
+ *
  * See config.h for keybindings and the SNAP_* edge-snapping settings.
  *
- * Build:  cc -O2 -o zzwm zzwm.c -lX11 -lXrender -lXcomposite -lXdamage -lXfixes -lXi -lXpresent -lm
+ * Build:  cc -O2 -o zzwm zzwm.c -lX11 -lXrender -lXcomposite -lXdamage -lXfixes -lXi -lXpresent -lXrandr -lm
  * Test:   Xephyr :1 -screen 1280x800 && DISPLAY=:1 ./zzwm
  */
 
@@ -34,6 +38,7 @@
 #include <X11/extensions/XInput2.h>
 #include <X11/extensions/Xpresent.h>
 #include <X11/extensions/Xrender.h>
+#include <X11/extensions/Xrandr.h>
 
 #include "appearance.h"
 
@@ -41,6 +46,7 @@
 #define ZOOM_MIN     0.05
 #define ZOOM_MAX     20.0
 #define MAX_CLIENTS  64
+#define MAX_MONITORS 8
 
 typedef enum { ACT_SPAWN, ACT_CLOSE } Action;
 typedef struct {
@@ -63,10 +69,14 @@ typedef struct {
     int cw, ch, depth;
     int anchor;   /* base window (ANCHOR_NAME, set in config.h) -- can't be closed or moved */
 } Client;
+
+/* Per-monitor viewport into the shared infinite canvas.
+ * cx,cy is the canvas point visible at the centre of this monitor. */
 typedef struct {
-    int sw, sh;
-    double cx, cy, zoom;
-} Viewport;
+    int    x, y, w, h;      /* position and size in virtual-screen pixels */
+    double cx, cy, zoom;    /* canvas point at monitor centre, zoom level */
+} Monitor;
+
 typedef struct {
     Display  *dpy;
     Window    root, overlay;
@@ -76,8 +86,9 @@ typedef struct {
     int       cur_buf;       /* buffer to draw into next */
     int       dirty;         /* a redraw is pending */
     uint32_t  present_serial;
-    int       sw, sh;
-    Viewport  vp;
+    int       sw, sh;        /* full virtual-screen dimensions (back-buffer size) */
+    Monitor   monitors[MAX_MONITORS];
+    int       nmonitors;
     XRenderPictFormat *fmt32, *fmt24;
     Client    clients[MAX_CLIENTS];
     int       nclients;
@@ -90,6 +101,7 @@ typedef struct {
     Window    hover_win;   /* client currently parked under the real cursor */
     int    panning, pan_sx, pan_sy;
     double pan_vx, pan_vy;
+    int    pan_mon;        /* index into monitors[] for the active pan */
     int    moving, move_sx, move_sy;
     double move_cx, move_cy;
     Window move_win;
@@ -108,38 +120,48 @@ static double now_secs(void) {
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-// called on any real input (key, button, motion) to reset the idle-lock countdown
 static void mark_activity(ZWM *z) {
     z->last_input = now_secs();
     z->idle_fired = 0;
 }
 
-static void to_screen(Viewport *v, double cx, double cy, double *sx, double *sy) {
-    *sx = (cx - v->cx) * v->zoom + v->sw / 2.0;
-    *sy = (cy - v->cy) * v->zoom + v->sh / 2.0;
+/* canvas <-> screen coordinate transforms for a specific monitor */
+static void to_screen(Monitor *m, double cx, double cy, double *sx, double *sy) {
+    *sx = (cx - m->cx) * m->zoom + m->x + m->w / 2.0;
+    *sy = (cy - m->cy) * m->zoom + m->y + m->h / 2.0;
 }
 
-static void to_canvas(Viewport *v, double sx, double sy, double *cx, double *cy) {
-    *cx = (sx - v->sw / 2.0) / v->zoom + v->cx;
-    *cy = (sy - v->sh / 2.0) / v->zoom + v->cy;
+static void to_canvas(Monitor *m, double sx, double sy, double *cx, double *cy) {
+    *cx = (sx - m->x - m->w / 2.0) / m->zoom + m->cx;
+    *cy = (sy - m->y - m->h / 2.0) / m->zoom + m->cy;
 }
 
-static void zoom_at(Viewport *v, double sx, double sy, double f) {
-    double cx, cy, zoom = v->zoom * f;
-    to_canvas(v, sx, sy, &cx, &cy); // canvas point currently under the cursor
-    v->zoom = zoom < ZOOM_MIN ? ZOOM_MIN : zoom > ZOOM_MAX ? ZOOM_MAX : zoom;
-    // re-center the viewport so that same canvas point stays under the cursor at the new zoom
-    v->cx = cx - (sx - v->sw / 2.0) / v->zoom;
-    v->cy = cy - (sy - v->sh / 2.0) / v->zoom;
+static void zoom_at(Monitor *m, double sx, double sy, double f) {
+    double cx, cy, zoom = m->zoom * f;
+    to_canvas(m, sx, sy, &cx, &cy);
+    m->zoom = zoom < ZOOM_MIN ? ZOOM_MIN : zoom > ZOOM_MAX ? ZOOM_MAX : zoom;
+    m->cx = cx - (sx - m->x - m->w / 2.0) / m->zoom;
+    m->cy = cy - (sy - m->y - m->h / 2.0) / m->zoom;
 }
 
-// screen-space rect for a client; minimum 1px so zoomed-out windows stay hit-testable
-static void srect(Client *c, Viewport *v, int *x, int *y, int *w, int *h) {
+/* return the monitor containing screen point (sx,sy); falls back to monitors[0] */
+static Monitor *monitor_at(ZWM *z, int sx, int sy) {
+    for (int i = 0; i < z->nmonitors; i++) {
+        Monitor *m = &z->monitors[i];
+        if (sx >= m->x && sx < m->x + m->w && sy >= m->y && sy < m->y + m->h)
+            return m;
+    }
+    return z->nmonitors ? &z->monitors[0] : NULL;
+}
+
+/* screen-space rect for a client as seen through monitor m; minimum 1px so
+ * zoomed-out windows stay hit-testable */
+static void srect(Client *c, Monitor *m, int *x, int *y, int *w, int *h) {
     double sx, sy;
-    to_screen(v, c->cx, c->cy, &sx, &sy);
+    to_screen(m, c->cx, c->cy, &sx, &sy);
     *x = (int)sx; *y = (int)sy;
-    *w = (int)(c->cw * v->zoom); if (*w < 1) *w = 1;
-    *h = (int)(c->ch * v->zoom); if (*h < 1) *h = 1;
+    *w = (int)(c->cw * m->zoom); if (*w < 1) *w = 1;
+    *h = (int)(c->ch * m->zoom); if (*h < 1) *h = 1;
 }
 
 static Client *find(ZWM *z, Window w) {
@@ -148,16 +170,17 @@ static Client *find(ZWM *z, Window w) {
     return NULL;
 }
 
-static Client *hit(ZWM *z, int sx, int sy) {
+/* hit-test using the viewport of monitor m (cursor is on that monitor) */
+static Client *hit(ZWM *z, Monitor *m, int sx, int sy) {
     for (int i = z->nclients - 1; i >= 0; i--) {
         int x, y, w, h;
-        srect(&z->clients[i], &z->vp, &x, &y, &w, &h);
+        srect(&z->clients[i], m, &x, &y, &w, &h);
         if (sx >= x && sx < x+w && sy >= y && sy < y+h) return &z->clients[i];
     }
     return NULL;
 }
 
-// override-redirect windows sit at real screen coords, so this is an unscaled rect test
+/* override-redirect windows sit at real screen coords, so this is an unscaled rect test */
 static Window hit_override(ZWM *z, int sx, int sy, XWindowAttributes *out) {
     for (int i = z->noverride - 1; i >= 0; i--) {
         Window w = z->overrides[i];
@@ -171,15 +194,15 @@ static Window hit_override(ZWM *z, int sx, int sy, XWindowAttributes *out) {
     return None;
 }
 
-// invert the canvas transform, then subtract the window's canvas-space origin -> window-local pixel
-static void to_client_local(Client *c, Viewport *v, int sx, int sy, int *wx, int *wy) {
+/* invert the canvas transform for monitor m -> window-local pixel */
+static void to_client_local(Client *c, Monitor *m, int sx, int sy, int *wx, int *wy) {
     double cx, cy;
-    to_canvas(v, sx, sy, &cx, &cy);
+    to_canvas(m, sx, sy, &cx, &cy);
     *wx = (int)(cx - c->cx);
     *wy = (int)(cy - c->cy);
 }
 
-// draw/hit-test order follows the array; moving c to the end raises it
+/* draw/hit-test order follows the array; moving c to the end raises it */
 static void raise_client(ZWM *z, Client *c) {
     int idx = (int)(c - z->clients);
     if (idx < 0 || idx >= z->nclients - 1) return;
@@ -188,7 +211,7 @@ static void raise_client(ZWM *z, Client *c) {
     z->clients[z->nclients - 1] = tmp;
 }
 
-// moves the real window off-screen at native size; on_hover() repositions it under the cursor
+/* moves the real window off-screen at native size; on_hover() repositions it under the cursor */
 static void park(ZWM *z, Client *c) {
     XMoveResizeWindow(z->dpy, c->window, -(c->cw+32), -(c->ch+32), c->cw, c->ch);
 }
@@ -199,15 +222,16 @@ static Client *manage(ZWM *z, Window w) {
     if (!XGetWindowAttributes(z->dpy, w, &a)) return NULL;
     Client *c = &z->clients[z->nclients++];
     c->window = w;
-    to_canvas(&z->vp, a.x, a.y, &c->cx, &c->cy);
+    /* convert existing screen position to canvas coords using the monitor it's on */
+    Monitor *m = monitor_at(z, a.x + a.width/2, a.y + a.height/2);
+    if (!m) m = &z->monitors[0];
+    to_canvas(m, a.x, a.y, &c->cx, &c->cy);
     c->cw = a.width; c->ch = a.height; c->depth = a.depth;
     char *name = NULL;
     c->anchor = XFetchName(z->dpy, w, &name) && name && !strcmp(name, ANCHOR_NAME);
     if (name) XFree(name);
-    if (a.border_width) XSetWindowBorderWidth(z->dpy, w, 0); // border would otherwise get baked into the composited pixmap
+    if (a.border_width) XSetWindowBorderWidth(z->dpy, w, 0);
     park(z, c);
-    // passive sync grab: on_hover() parks the client under the cursor, then on_button() replays
-    // the press through so X delivers it (and the rest of the drag) straight to the client
     XGrabButton(z->dpy, Button1, 0, w, False, ButtonPressMask,
                 GrabModeSync, GrabModeAsync, None, None);
     XGrabButton(z->dpy, Button3, 0, w, False, ButtonPressMask,
@@ -216,7 +240,6 @@ static Client *manage(ZWM *z, Window w) {
     return c;
 }
 
-// menus/tooltips/dropdowns skip WM negotiation but still get composited, at native screen position
 static void manage_override(ZWM *z, Window w) {
     for (int i = 0; i < z->noverride; i++) if (z->overrides[i] == w) return;
     if (z->noverride == MAX_CLIENTS) return;
@@ -246,8 +269,8 @@ static void unmanage(ZWM *z, Window w) {
     }
 }
 
-// shared tail of both redraw() loops; zoom <= 0 skips the transform (override-redirect popups
-// always draw at native scale)
+/* shared tail of both redraw() loops; zoom <= 0 skips the transform (override-redirect popups
+ * always draw at native scale) */
 static void composite_window(ZWM *z, Window w, int depth, double zoom, int op,
                               Picture dst, int sx, int sy, int sw, int sh) {
     Pixmap pix = XCompositeNameWindowPixmap(z->dpy, w);
@@ -257,7 +280,7 @@ static void composite_window(ZWM *z, Window w, int depth, double zoom, int op,
     if (zoom > 0 && zoom != 1.0) {
         XFixed inv = XDoubleToFixed(1.0 / zoom);
         XTransform xf = {{{ inv, 0, 0 }, { 0, inv, 0 }, { 0, 0, XDoubleToFixed(1.0) }}};
-        const char *filt = zoom > 1.0 ? FilterNearest : FilterBilinear; // bilinear blurs when magnifying
+        const char *filt = zoom > 1.0 ? FilterNearest : FilterBilinear;
         XRenderSetPictureFilter(z->dpy, src, filt, NULL, 0);
         XRenderSetPictureTransform(z->dpy, src, &xf);
     }
@@ -266,28 +289,47 @@ static void composite_window(ZWM *z, Window w, int depth, double zoom, int op,
     XFreePixmap(z->dpy, pix);
 }
 
-// builds one full frame into the backbuffer that isn't currently owned by the X server
+/* builds one full frame into the back-buffer.
+ * Each monitor is composited independently with its own viewport, clipped to
+ * its screen rect so adjacent monitors don't bleed into each other. */
 static void composite_frame(ZWM *z) {
     Picture dst = z->backbuf_pic[z->cur_buf];
     XRenderColor bg = { CANVAS_BG_R * 257, CANVAS_BG_G * 257, CANVAS_BG_B * 257, 0xffff };
-    XRectangle rect = { 0, 0, (unsigned short)z->sw, (unsigned short)z->sh };
-    XRenderFillRectangles(z->dpy, PictOpSrc, dst, &bg, &rect, 1);
     XRenderColor border_col = { BORDER_R * 257, BORDER_G * 257, BORDER_B * 257, 0xffff };
 
-    for (int i = 0; i < z->nclients; i++) {
-        Client *c = &z->clients[i];
-        int sx, sy, sw, sh;
-        srect(c, &z->vp, &sx, &sy, &sw, &sh);
-        int bw = (int)(BORDER_THICKNESS * z->vp.zoom + 0.5); // scales with zoom, like the window
-        int bx = sx - bw, by = sy - bw, bsw = sw + 2*bw, bsh = sh + 2*bw;
-        if (bx >= z->sw || by >= z->sh || bx+bsw <= 0 || by+bsh <= 0) continue;
-        if (bw > 0) {
-            XRectangle brect = { (short)bx, (short)by,
-                                  (unsigned short)bsw, (unsigned short)bsh };
-            XRenderFillRectangles(z->dpy, PictOpSrc, dst, &border_col, &brect, 1);
+    /* fill the entire back-buffer with the canvas background */
+    XRectangle full = { 0, 0, (unsigned short)z->sw, (unsigned short)z->sh };
+    XRenderFillRectangles(z->dpy, PictOpSrc, dst, &bg, &full, 1);
+
+    for (int mi = 0; mi < z->nmonitors; mi++) {
+        Monitor *m = &z->monitors[mi];
+        /* clip rendering to this monitor's screen region */
+        XRectangle mrect = { (short)m->x, (short)m->y,
+                             (unsigned short)m->w, (unsigned short)m->h };
+        XRenderSetPictureClipRectangles(z->dpy, dst, 0, 0, &mrect, 1);
+
+        for (int i = 0; i < z->nclients; i++) {
+            Client *c = &z->clients[i];
+            int sx, sy, sw, sh;
+            srect(c, m, &sx, &sy, &sw, &sh);
+            int bw = (int)(BORDER_THICKNESS * m->zoom + 0.5);
+            int bx = sx - bw, by = sy - bw, bsw = sw + 2*bw, bsh = sh + 2*bw;
+            /* skip windows entirely outside this monitor */
+            if (bx >= m->x + m->w || by >= m->y + m->h ||
+                bx + bsw <= m->x   || by + bsh <= m->y) continue;
+            if (bw > 0) {
+                XRectangle brect = { (short)bx, (short)by,
+                                     (unsigned short)bsw, (unsigned short)bsh };
+                XRenderFillRectangles(z->dpy, PictOpSrc, dst, &border_col, &brect, 1);
+            }
+            composite_window(z, c->window, c->depth, m->zoom, PictOpSrc, dst, sx, sy, sw, sh);
         }
-        composite_window(z, c->window, c->depth, z->vp.zoom, PictOpSrc, dst, sx, sy, sw, sh);
     }
+
+    /* remove per-monitor clip before drawing override-redirect windows, which
+     * live at native screen coordinates and may span monitor boundaries */
+    XRenderSetPictureClipRectangles(z->dpy, dst, 0, 0, &full, 1);
+
     for (int i = 0; i < z->noverride; i++) {
         Window w = z->overrides[i];
         XWindowAttributes a;
@@ -297,8 +339,6 @@ static void composite_frame(ZWM *z) {
     }
 }
 
-// hands the just-built backbuffer to the Present extension, which copies it onto the overlay
-// window synced to the next vblank (no PresentOptionAsync) -- this is what kills the tearing
 static void present(ZWM *z) {
     int i = z->cur_buf;
     XPresentPixmap(z->dpy, z->overlay, z->backbuf[i], ++z->present_serial,
@@ -310,8 +350,6 @@ static void present(ZWM *z) {
     z->dirty = 0;
 }
 
-// draws+presents only if the next buffer is free; otherwise leaves dirty set so
-// on_present_idle() retries once the server signals that buffer is no longer in use
 static void pump_redraw(ZWM *z) {
     if (!z->dirty || z->buf_busy[z->cur_buf]) return;
     composite_frame(z);
@@ -336,11 +374,16 @@ static void on_map(ZWM *z, XMapRequestEvent *ev) {
     Client *c = find(z, ev->window);
     if (!c && (c = manage(z, ev->window))) {
         if (c->anchor) {
-            c->cx = -c->cw / 2.0; // fixed at the canvas origin, not wherever the viewport is
+            c->cx = -c->cw / 2.0;
             c->cy = -c->ch / 2.0;
         } else {
-            c->cx = z->vp.cx - c->cw / 2.0;
-            c->cy = z->vp.cy - c->ch / 2.0;
+            /* center the window on the monitor containing the cursor */
+            Window dr, dc; int rx, ry, wx, wy; unsigned int mask;
+            XQueryPointer(z->dpy, z->root, &dr, &dc, &rx, &ry, &wx, &wy, &mask);
+            Monitor *m = monitor_at(z, rx, ry);
+            if (!m) m = &z->monitors[0];
+            c->cx = m->cx - c->cw / 2.0;
+            c->cy = m->cy - c->ch / 2.0;
         }
     }
     XMapWindow(z->dpy, ev->window);
@@ -358,7 +401,6 @@ static void on_destroy(ZWM *z, XDestroyWindowEvent *ev) {
     unmanage(z, ev->window); unmanage_override(z, ev->window); request_redraw(z);
 }
 
-// override-redirect windows map themselves directly, so we only see them via MapNotify
 static void on_mapnotify(ZWM *z, XMapEvent *ev) {
     if (ev->window == z->overlay) return;
     XWindowAttributes a;
@@ -369,12 +411,10 @@ static void on_mapnotify(ZWM *z, XMapEvent *ev) {
 static void on_configure(ZWM *z, XConfigureRequestEvent *ev) {
     Client *c = find(z, ev->window);
     if (c) {
-        // size only; canvas position (c->cx/cy) is ours to manage, not the client's to request
         if (ev->value_mask & CWWidth)  c->cw = ev->width;
         if (ev->value_mask & CWHeight) c->ch = ev->height;
         park(z, c);
     } else {
-        // not yet managed (e.g. still override-redirect): honor the request as-is
         XWindowChanges wc = { .x = ev->x, .y = ev->y,
             .width = ev->width, .height = ev->height,
             .border_width = ev->border_width, .sibling = ev->above, .stack_mode = ev->detail };
@@ -384,28 +424,31 @@ static void on_configure(ZWM *z, XConfigureRequestEvent *ev) {
 
 static Client *focus_raise(ZWM *z, Client *c) {
     raise_client(z, c);
-    c = &z->clients[z->nclients - 1]; // raise_client() shuffled the array; re-fetch c
+    c = &z->clients[z->nclients - 1];
     z->focused = c->window;
-    XRaiseWindow(z->dpy, c->window); // real stacking only needs to move on click, not on every hover tick --
-                                      // otherwise it keeps clobbering the stacking of open menus/popups
+    XRaiseWindow(z->dpy, c->window);
     XSetInputFocus(z->dpy, c->window, RevertToPointerRoot, CurrentTime);
     request_redraw(z);
     return c;
 }
 
 static void on_button(ZWM *z, XButtonEvent *ev) {
-    if (ev->button == 4) { zoom_at(&z->vp, ev->x_root, ev->y_root, ZOOM_SPEED);     request_redraw(z); return; }
-    if (ev->button == 5) { zoom_at(&z->vp, ev->x_root, ev->y_root, 1.0/ZOOM_SPEED); request_redraw(z); return; }
+    Monitor *m = monitor_at(z, ev->x_root, ev->y_root);
+    if (!m) m = &z->monitors[0];
+
+    if (ev->button == 4) { zoom_at(m, ev->x_root, ev->y_root, ZOOM_SPEED);     request_redraw(z); return; }
+    if (ev->button == 5) { zoom_at(m, ev->x_root, ev->y_root, 1.0/ZOOM_SPEED); request_redraw(z); return; }
     if (ev->button == 2) {
         z->panning = 1; z->pan_sx = ev->x_root; z->pan_sy = ev->y_root;
-        z->pan_vx = z->vp.cx; z->pan_vy = z->vp.cy;
+        z->pan_vx = m->cx; z->pan_vy = m->cy;
+        z->pan_mon = (int)(m - z->monitors);
         XGrabPointer(z->dpy, z->overlay, True, PointerMotionMask|ButtonReleaseMask,
                      GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
         return;
     }
     if (ev->button != 1 && ev->button != 3) return;
-    if (ev->state & Mod4Mask) { // Super+drag, grabbed globally on the root: a WM gesture, not a client click
-        Client *c = hit(z, ev->x_root, ev->y_root);
+    if (ev->state & Mod4Mask) {
+        Client *c = hit(z, m, ev->x_root, ev->y_root);
         if (!c) return;
         c = focus_raise(z, c);
         if (ev->button == 1 && !c->anchor) {
@@ -424,8 +467,6 @@ static void on_button(ZWM *z, XButtonEvent *ev) {
         return;
     }
 
-    // plain click: per-client grab from manage() fired. focus+raise, then replay so X
-    // re-hit-tests and delivers the press (and the rest of the drag) to the client for real.
     Client *c = find(z, ev->window);
     if (c) focus_raise(z, c);
     XAllowEvents(z->dpy, ReplayPointer, ev->time);
@@ -440,7 +481,6 @@ static void on_release(ZWM *z, XButtonEvent *ev) {
     }
 }
 
-// edge snapping, see SNAP_* in config.h
 static void snap_translate(ZWM *z, Client *c, double basex, double basey, double *dx, double *dy) {
     if (!SNAP_ENABLED) return;
     double l = basex + *dx, r = l + c->cw, t = basey + *dy, b = t + c->ch;
@@ -450,8 +490,6 @@ static void snap_translate(ZWM *z, Client *c, double basex, double basey, double
         Client *o = &z->clients[i];
         if (o == c) continue;
         double ol = o->cx, orr = o->cx + o->cw, ot = o->cy, ob = o->cy + o->ch;
-        // each window offers up to 4 candidates (flush or SNAP_GAP apart, each edge); smallest under
-        // SNAP_DIST wins. Require overlap on the other axis so windows don't snap on a coincidence.
         if (t < ob && b > ot) {
             double xc[4] = { ol - l, (orr + SNAP_GAP) - l, orr - r, (ol - SNAP_GAP) - r };
             for (int k = 0; k < 4; k++) if (fabs(xc[k]) < fabs(bestx)) { bestx = xc[k]; ox = o; }
@@ -461,8 +499,6 @@ static void snap_translate(ZWM *z, Client *c, double basex, double basey, double
             for (int k = 0; k < 4; k++) if (fabs(yc[k]) < fabs(besty)) { besty = yc[k]; oy = o; }
         }
     }
-    // a window that already won one axis is retried on the other axis without the overlap
-    // requirement, so corners can snap to corners
     if (ox && !oy) {
         double ot = ox->cy, ob = ox->cy + ox->ch;
         double yc[4] = { ot - t, (ob + SNAP_GAP) - t, ob - b, (ot - SNAP_GAP) - b };
@@ -476,7 +512,6 @@ static void snap_translate(ZWM *z, Client *c, double basex, double basey, double
     if (oy) *dy += besty;
 }
 
-// same idea as snap_translate(), but only the bottom-right edge moves
 static void snap_resize(ZWM *z, Client *c, double *dw, double *dh) {
     if (!SNAP_ENABLED) return;
     double l = c->cx, r = l + c->cw + *dw, t = c->cy, b = t + c->ch + *dh;
@@ -511,11 +546,15 @@ static void snap_resize(ZWM *z, Client *c, double *dw, double *dh) {
 static void on_motion(ZWM *z, XMotionEvent *ev) {
     XEvent next;
     while (XCheckTypedEvent(z->dpy, MotionNotify, &next)) *ev = next.xmotion;
+
+    Monitor *m = monitor_at(z, ev->x_root, ev->y_root);
+    if (!m) m = &z->monitors[0];
+
     if (z->moving) {
         Client *c = find(z, z->move_win);
         if (c) {
-            double dx = (ev->x_root - z->move_sx) / z->vp.zoom;
-            double dy = (ev->y_root - z->move_sy) / z->vp.zoom;
+            double dx = (ev->x_root - z->move_sx) / m->zoom;
+            double dy = (ev->y_root - z->move_sy) / m->zoom;
             snap_translate(z, c, z->move_cx, z->move_cy, &dx, &dy);
             c->cx = z->move_cx + dx;
             c->cy = z->move_cy + dy;
@@ -524,8 +563,8 @@ static void on_motion(ZWM *z, XMotionEvent *ev) {
     } else if (z->resizing) {
         Client *c = find(z, z->resize_win);
         if (c) {
-            double dw = (ev->x_root - z->resize_sx) / z->vp.zoom;
-            double dh = (ev->y_root - z->resize_sy) / z->vp.zoom;
+            double dw = (ev->x_root - z->resize_sx) / m->zoom;
+            double dh = (ev->y_root - z->resize_sy) / m->zoom;
             snap_resize(z, c, &dw, &dh);
             int nw = z->resize_cw0 + (int)dw;
             int nh = z->resize_ch0 + (int)dh;
@@ -535,16 +574,16 @@ static void on_motion(ZWM *z, XMotionEvent *ev) {
             request_redraw(z);
         }
     } else if (z->panning) {
-        z->vp.cx = z->pan_vx - (ev->x_root - z->pan_sx) / z->vp.zoom;
-        z->vp.cy = z->pan_vy - (ev->y_root - z->pan_sy) / z->vp.zoom;
+        Monitor *pm = &z->monitors[z->pan_mon];
+        pm->cx = z->pan_vx - (ev->x_root - z->pan_sx) / pm->zoom;
+        pm->cy = z->pan_vy - (ev->y_root - z->pan_sy) / pm->zoom;
         request_redraw(z);
     }
 }
 
-// driven by XI_RawMotion (global on the root), which fires on every pointer move regardless of
-// which window owns a grab, so it never disturbs a drag's implicit grab (see on_button()).
-// Parks whichever client is under the cursor at the matching real screen position so plain
-// X routing delivers input to the right native pixel (real stacking is untouched here).
+/* driven by XI_RawMotion; parks whichever client is under the cursor at the
+ * matching real screen position so plain X routing delivers input to the
+ * right native pixel */
 static void on_hover(ZWM *z) {
     Window root_ret, child_ret;
     int root_x, root_y, win_x, win_y;
@@ -555,15 +594,15 @@ static void on_hover(ZWM *z) {
 
     XWindowAttributes a;
     Window ov = hit_override(z, root_x, root_y, &a);
-    Client *c = ov ? NULL : hit(z, root_x, root_y);
+    Monitor *m = monitor_at(z, root_x, root_y);
+    if (!m) m = &z->monitors[0];
+    Client *c = ov ? NULL : hit(z, m, root_x, root_y);
+
     if (c && z->hover_win && c->window != z->hover_win) {
         Client *prev = find(z, z->hover_win);
         if (prev) park(z, prev);
     }
     if (!c) {
-        // hovering an open menu/dropdown: leave its parent's real window exactly where it
-        // is -- popups that track their anchor's screen position (e.g. GTK) will visibly
-        // jump if we park it, since parking moves the real window away
         if (!ov && z->hover_win) {
             Client *prev = find(z, z->hover_win);
             if (prev) park(z, prev);
@@ -573,9 +612,7 @@ static void on_hover(ZWM *z) {
     }
 
     int wx, wy;
-    to_client_local(c, &z->vp, root_x, root_y, &wx, &wy);
-    // reposition only -- real stacking is left alone here so hovering never bumps an
-    // open menu/dropdown's popup out from under itself (see focus_raise() for the raise)
+    to_client_local(c, m, root_x, root_y, &wx, &wy);
     XMoveWindow(z->dpy, c->window, root_x - wx, root_y - wy);
     z->hover_win = c->window;
 }
@@ -597,13 +634,32 @@ static void on_key(ZWM *z, XKeyEvent *ev) {
 }
 
 int main(void) {
-    ZWM z = { .vp = { .zoom = 1.0 } };
+    ZWM z = {0};
 
     if (!(z.dpy = XOpenDisplay(NULL))) { fputs("zzwm: no display\n", stderr); return 1; }
     int scr = DefaultScreen(z.dpy);
     z.root = RootWindow(z.dpy, scr);
-    z.sw = z.vp.sw = DisplayWidth(z.dpy, scr);
-    z.sh = z.vp.sh = DisplayHeight(z.dpy, scr);
+    z.sw = DisplayWidth(z.dpy, scr);
+    z.sh = DisplayHeight(z.dpy, scr);
+
+    /* query monitor layout via RandR; fall back to a single full-screen monitor */
+    int rr_ev, rr_err, rr_base;
+    if (XQueryExtension(z.dpy, "RANDR", &rr_base, &rr_ev, &rr_err)) {
+        int nmon = 0;
+        XRRMonitorInfo *mons = XRRGetMonitors(z.dpy, z.root, True, &nmon);
+        for (int i = 0; i < nmon && z.nmonitors < MAX_MONITORS; i++) {
+            Monitor *m = &z.monitors[z.nmonitors++];
+            m->x = mons[i].x; m->y = mons[i].y;
+            m->w = mons[i].width; m->h = mons[i].height;
+            m->cx = 0; m->cy = 0; m->zoom = 1.0;
+        }
+        if (mons) XRRFreeMonitors(mons);
+    }
+    if (!z.nmonitors) {
+        z.monitors[0].w = z.sw; z.monitors[0].h = z.sh;
+        z.monitors[0].zoom = 1.0;
+        z.nmonitors = 1;
+    }
 
     XSetErrorHandler(xerr);
     XSelectInput(z.dpy, z.root, SubstructureRedirectMask|SubstructureNotifyMask);
@@ -629,10 +685,6 @@ int main(void) {
         XGrabKey(z.dpy, b->keycode, b->mod, z.root, True, GrabModeAsync, GrabModeAsync);
     }
 
-    // Super+move/resize/pan/zoom are WM gestures, grabbed globally on the root, only with Super
-    // held. Plain clicks/scroll/middle-click stay ungrabbed -- they go straight to whatever
-    // client window is under the cursor (manage()'s per-client grab catches plain Button1/3
-    // for the focus-then-replay dance instead).
     int wheel_btns[] = { Button1, Button3, Button2, Button4, Button5 };
     for (int i = 0; i < 5; i++)
         XGrabButton(z.dpy, wheel_btns[i], Mod4Mask, z.root, True, ButtonPressMask,
@@ -647,11 +699,7 @@ int main(void) {
     z.overlay = XCompositeGetOverlayWindow(z.dpy, z.root);
     XSelectInput(z.dpy, z.overlay, ButtonPressMask|ButtonReleaseMask|PointerMotionMask|KeyPressMask);
     Cursor cur = XCreateFontCursor(z.dpy, XC_left_ptr);
-    // set on the root, not the overlay: the overlay's input shape is empty (below), so cursor
-    // lookup falls through to the root or to a client (which inherits from root, non-reparenting)
     XDefineCursor(z.dpy, z.root, cur); XFreeCursor(z.dpy, cur);
-    // empty input shape makes the overlay click-through, so clicks reach whatever client
-    // on_hover() has parked under the cursor; WM gestures don't need this, they're grabbed on the root
     XserverRegion empty = XFixesCreateRegion(z.dpy, NULL, 0);
     XFixesSetWindowShapeRegion(z.dpy, z.overlay, ShapeInput, 0, 0, empty);
     XFixesDestroyRegion(z.dpy, empty);
@@ -683,8 +731,6 @@ int main(void) {
 
     XEvent ev;
     for (;;) {
-        // idle lock: wait for an X event, but wake up early to check the idle timer so
-        // IDLE_LOCK_CMD fires even while nothing else is happening on the connection
         if (IDLE_LOCK_TIMEOUT > 0) {
             int fd = ConnectionNumber(z.dpy);
             while (!XPending(z.dpy)) {
